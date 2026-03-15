@@ -24,7 +24,7 @@ PREDICTION_CHANNEL_ID = -1003430118891
 # PARAMÈTRES DU SERVEUR WEB
 # ============================================================================
 
-PORT = int(os.environ.get("PORT", 10000))
+PORT = int(os.environ.get("PORT", 5000))
 
 # ============================================================================
 # CONFIGURATION COSTUMES
