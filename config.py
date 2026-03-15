@@ -18,13 +18,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 SOURCE_CHANNEL_ID = -1002682552255
-PREDICTION_CHANNEL_ID = -1003501017916
+PREDICTION_CHANNEL_ID = -1003430118891
 
 # ============================================================================
 # PARAMÈTRES DU SERVEUR WEB
 # ============================================================================
 
-PORT = int(os.environ.get("PORT", 8000))
+PORT = int(os.environ.get("PORT", 10000))
 
 # ============================================================================
 # CONFIGURATION COSTUMES
@@ -43,7 +43,7 @@ SUIT_DISPLAY = {
 # PARAMÈTRES COMPTEUR2
 # ============================================================================
 
-COMPTEUR2_SEUIL_B_DEFAULT = 2
+COMPTEUR2_SEUIL_B_DEFAULT = 3
 COMPTEUR2_ACTIVE_DEFAULT = True
 
 # ============================================================================
