@@ -215,7 +215,8 @@ class Compteur2Tracker:
     suit: str
     counter: int = 0
     last_increment_game: int = 0
-    
+    streak_start_game: int = 0  # Jeu où la série d'absences a débuté
+
     def get_display_name(self) -> str:
         names = {
             '♠': '♠️ Pique',
@@ -224,18 +225,21 @@ class Compteur2Tracker:
             '♣': '♣️ Trèfle'
         }
         return names.get(self.suit, self.suit)
-    
+
     def increment(self, game_number: int):
+        if self.counter == 0:
+            self.streak_start_game = game_number
         self.counter += 1
         self.last_increment_game = game_number
         logger.info(f"📊 Compteur2 {self.suit}: {self.counter} (incrémenté au jeu #{game_number})")
-    
+
     def reset(self, game_number: int):
         if self.counter > 0:
             logger.info(f"🔄 Compteur2 {self.suit}: reset de {self.counter} à 0 (trouvé au jeu #{game_number})")
         self.counter = 0
         self.last_increment_game = 0
-    
+        self.streak_start_game = 0
+
     def check_threshold(self, seuil_B: int) -> bool:
         return self.counter >= seuil_B
 
@@ -245,6 +249,7 @@ class Compteur3Tracker:
     suit: str
     counter: int = 0
     last_increment_game: int = 0
+    streak_start_game: int = 0  # Jeu où la série d'absences a débuté
 
     def get_display_name(self) -> str:
         names = {
@@ -256,6 +261,8 @@ class Compteur3Tracker:
         return names.get(self.suit, self.suit)
 
     def increment(self, game_number: int):
+        if self.counter == 0:
+            self.streak_start_game = game_number
         self.counter += 1
         self.last_increment_game = game_number
         logger.info(f"📊 Compteur3 {self.suit}: {self.counter} (incrémenté au jeu #{game_number})")
@@ -265,6 +272,7 @@ class Compteur3Tracker:
             logger.info(f"🔄 Compteur3 {self.suit}: reset de {self.counter} à 0 (trouvé au jeu #{game_number})")
         self.counter = 0
         self.last_increment_game = 0
+        self.streak_start_game = 0
 
     def check_threshold(self, seuil_B2: int) -> bool:
         return self.counter >= seuil_B2
@@ -1136,6 +1144,95 @@ def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
 
     return ready
 
+
+def get_synchro_status() -> List[dict]:
+    """Retourne l'état des paires inverses C2+C3 pour affichage /synchro.
+    Ne modifie aucun compteur.
+    Paires inverses : ♣↔❤️  et  ♦↔♠️
+    Le suivi est toujours basé sur des numéros consécutifs finalisés (🔰/✅).
+    """
+    global compteur2_trackers, compteur2_seuil_B, B_SPECIAL, blocked_suits_for_distribution
+    global compteur3_trackers, compteur3_seuil_B2
+
+    pairs = [('♣', '♥'), ('♦', '♠')]
+    result = []
+
+    for suit_c2, suit_c3 in pairs:
+        tc2 = compteur2_trackers.get(suit_c2)
+        tc3 = compteur3_trackers.get(suit_c3)
+        if not tc2 or not tc3:
+            continue
+
+        effective_B = B_SPECIAL if blocked_suits_for_distribution.get(suit_c2, False) else compteur2_seuil_B
+
+        c2_ready = tc2.counter >= effective_B
+        c3_ready = tc3.counter >= compteur3_seuil_B2
+
+        synchro = c2_ready and c3_ready
+
+        result.append({
+            'suit_c2': suit_c2,
+            'suit_c3': suit_c3,
+            'c2_counter': tc2.counter,
+            'c2_threshold': effective_B,
+            'c2_streak_start': tc2.streak_start_game,
+            'c2_last_game': tc2.last_increment_game,
+            'c2_ready': c2_ready,
+            'c3_counter': tc3.counter,
+            'c3_threshold': compteur3_seuil_B2,
+            'c3_streak_start': tc3.streak_start_game,
+            'c3_last_game': tc3.last_increment_game,
+            'c3_ready': c3_ready,
+            'synchro': synchro,
+        })
+
+    return result
+
+
+def get_synchro_predictions(current_game: int) -> List[tuple]:
+    """Détecte la synchronisation C3→C2 inverse et retourne les prédictions.
+    Complément de get_compteur2_ready_predictions (qui traite C2→C3).
+    Déclenche quand C3 pour suit_c3 atteint B2 ET C2 pour suit_c2=inverse(suit_c3)
+    est aussi à seuil → prédit le manque du C2 (suit_c2).
+    Attend exclusivement les messages finalisés (🔰/✅).
+    """
+    global compteur2_trackers, compteur2_seuil_B, B_SPECIAL, blocked_suits_for_distribution
+    global compteur3_trackers, compteur3_seuil_B2, COMPTEUR3_Z, last_prediction_number_sent
+
+    ready = []
+    pairs = [('♣', '♥'), ('♦', '♠')]
+
+    for suit_c2, suit_c3 in pairs:
+        tc2 = compteur2_trackers.get(suit_c2)
+        tc3 = compteur3_trackers.get(suit_c3)
+        if not tc2 or not tc3:
+            continue
+
+        effective_B = B_SPECIAL if blocked_suits_for_distribution.get(suit_c2, False) else compteur2_seuil_B
+
+        c2_ready = tc2.counter >= effective_B
+        c3_ready = tc3.counter >= compteur3_seuil_B2
+
+        if not c2_ready or not c3_ready:
+            continue
+
+        # Les deux atteignent leur seuil ensemble sur des numéros consécutifs
+        # finalisés (🔰/✅) — on prédit le manque du C2 (côté 1er groupe)
+        base = last_prediction_number_sent if last_prediction_number_sent > 0 else current_game
+        pred_number = base + COMPTEUR3_Z
+
+        logger.info(
+            f"🔁 SYNCHRO INVERSE: C3={suit_c3}({tc3.counter}) ↔ C2={suit_c2}({tc2.counter}) "
+            f"→ Prédiction #{pred_number} ({suit_c2}) [manque C2, Z={COMPTEUR3_Z}]"
+        )
+
+        ready.append((suit_c2, pred_number, 'synchro_inverse'))
+        tc2.reset(current_game)
+        tc3.reset(current_game)
+
+    return ready
+
+
 # ============================================================================
 # GESTION INTELLIGENTE DE LA FILE D'ATTENTE (avec pause)
 # ============================================================================
@@ -1328,6 +1425,15 @@ async def process_game_result(game_number: int, message_text: str):
             if added:
                 type_label = "🔄 Compteur3 INVERSE" if pred_type == 'compteur3_inverse' else "📊 Compteur2"
                 logger.info(f"{type_label}: #{pred_num} ({predicted_suit}) en file d'attente")
+
+    # Synchro inverse C3→C2 (complément du C2→C3 ci-dessus)
+    # Uniquement sur messages finalisés (🔰/✅), numéros consécutifs garantis
+    if compteur2_active and compteur3_active:
+        synchro_preds = get_synchro_predictions(game_number)
+        for predicted_suit, pred_num, pred_type in synchro_preds:
+            added = add_to_prediction_queue(pred_num, predicted_suit, pred_type)
+            if added:
+                logger.info(f"🔁 SYNCHRO INVERSE: #{pred_num} ({predicted_suit}) en file d'attente")
 
 async def handle_message(event, is_edit: bool = False):
     try:
@@ -2181,8 +2287,8 @@ async def cmd_queue(event):
                 pred_type = pred['type']
                 pred_num = pred['game_number']
                 
-                type_str = "🎯Dist" if pred_type == 'distribution' else "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🤖"
-                
+                type_str = "🎯Dist" if pred_type == 'distribution' else "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🔁SYN" if pred_type == 'synchro_inverse' else "🤖"
+
                 send_threshold = pred_num - PREDICTION_SEND_AHEAD
                 
                 if current_game_number >= send_threshold:
@@ -2293,7 +2399,7 @@ async def cmd_history(event):
             status = pred['status']
             pred_time = pred['predicted_at'].strftime('%H:%M:%S')
             
-            rule = "🎯#R" if pred.get('type') == 'distribution' else "📊C2" if pred.get('type') == 'compteur2' else "🔄C3⚡" if pred.get('type') == 'compteur3_inverse' else "🤖"
+            rule = "🎯#R" if pred.get('type') == 'distribution' else "📊C2" if pred.get('type') == 'compteur2' else "🔄C3⚡" if pred.get('type') == 'compteur3_inverse' else "🔁SYN" if pred.get('type') == 'synchro_inverse' else "🤖"
             emoji = {'en_cours': '🎰', 'gagne_r0': '🏆', 'gagne_r1': '🏆', 'gagne_r2': '🏆', 'perdu': '💔'}.get(status, '❓')
             
             lines.append(f"{i}. {emoji} #{pred['predicted_game']} {suit} | {rule} | {status}")
@@ -2373,6 +2479,7 @@ async def cmd_help(event):
 `/stats` - Historique séries ≥3 (Compteur1)
 `/compteur3 [B2/on/off/reset]` - Gérer Compteur3 (2ème groupe)
 `/setz [1-20]` - Offset Z pour prédiction inverse C3 (actuel: {COMPTEUR3_Z})
+`/synchro` - Voir synchro C2+C3 inverses (♣↔❤️ / ♦↔♠️)
 
 **📡 Canaux:**
 `/canaldistribution [ID/off]`
@@ -2429,7 +2536,7 @@ async def cmd_pending(event):
             sent_time = pred.get('sent_time')
             pred_type = pred.get('type', 'standard')
             
-            type_str = "🎯#R" if pred_type == 'distribution' else "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🤖"
+            type_str = "🎯#R" if pred_type == 'distribution' else "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🔁SYN" if pred_type == 'synchro_inverse' else "🤖"
             
             age_str = ""
             timeout_str = ""
@@ -2578,6 +2685,75 @@ async def cmd_setz(event):
         await event.respond(f"❌ Erreur: {e}")
 
 
+async def cmd_synchro(event):
+    """Affiche l'état de synchronisation inverse C2+C3 pour chaque paire.
+    Indique si les manquants des deux compteurs sont inverses et ont atteint
+    leur seuil B ensemble, sur des numéros consécutifs finalisés (🔰/✅).
+    Aucun numéro n'est jamais ignoré : le bot attend toujours qu'un jeu
+    soit finalisé (🔰 ou ✅) avant de l'incarner dans les compteurs.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        pairs_status = get_synchro_status()
+
+        lines = [
+            "🔁 **SYNCHRO INVERSE C2 ↔ C3**",
+            f"Paires inverses : ♣↔❤️  |  ♦↔♠️",
+            f"Seuil C2 (B normal) : **{compteur2_seuil_B}**  |  Seuil C3 (B2) : **{compteur3_seuil_B2}**  |  Z : **{COMPTEUR3_Z}**",
+            f"Suivi sur numéros consécutifs finalisés (🔰/✅) uniquement",
+            "",
+        ]
+
+        for p in pairs_status:
+            sc2 = SUIT_DISPLAY.get(p['suit_c2'], p['suit_c2'])
+            sc3 = SUIT_DISPLAY.get(p['suit_c3'], p['suit_c3'])
+
+            # Barres de progression
+            c2_prog = min(p['c2_counter'], p['c2_threshold'])
+            c2_bar = f"[{'█' * c2_prog}{'░' * (p['c2_threshold'] - c2_prog)}]"
+            c2_status = "🔮 PRÊT" if p['c2_ready'] else f"{p['c2_counter']}/{p['c2_threshold']}"
+            c2_start = f"depuis #{p['c2_streak_start']}" if p['c2_streak_start'] else "pas de série"
+
+            c3_prog = min(p['c3_counter'], p['c3_threshold'])
+            c3_bar = f"[{'█' * c3_prog}{'░' * (p['c3_threshold'] - c3_prog)}]"
+            c3_status = "🔮 PRÊT" if p['c3_ready'] else f"{p['c3_counter']}/{p['c3_threshold']}"
+            c3_start = f"depuis #{p['c3_streak_start']}" if p['c3_streak_start'] else "pas de série"
+
+            if p['synchro']:
+                header = f"✅ **SYNCHRO ACTIVE** — {sc2} (C2) ↔ {sc3} (C3)"
+                pred_suit = SUIT_DISPLAY.get(p['suit_c2'], p['suit_c2'])
+                pred_note = f"  → Prédiction : manque **{pred_suit}** (C2) au jeu dernier+{COMPTEUR3_Z}"
+            else:
+                header = f"⏳ En attente — {sc2} (C2) ↔ {sc3} (C3)"
+                missing_parts = []
+                if not p['c2_ready']:
+                    missing_parts.append(f"C2 {sc2} : {p['c2_counter']}/{p['c2_threshold']}")
+                if not p['c3_ready']:
+                    missing_parts.append(f"C3 {sc3} : {p['c3_counter']}/{p['c3_threshold']}")
+                pred_note = f"  → Manque encore : {' | '.join(missing_parts)}"
+
+            lines.append(header)
+            lines.append(f"  C2 {sc2} : {c2_bar} {c2_status} ({c2_start})")
+            lines.append(f"  C3 {sc3} : {c3_bar} {c3_status} ({c3_start})")
+            lines.append(pred_note)
+            lines.append("")
+
+        lines.append("ℹ️ La prédiction synchro se déclenche automatiquement quand")
+        lines.append("C3 et C2 inverses atteignent leur seuil B ensemble.")
+        lines.append("Elle prédit le manque du C2 (🔁SYN) avec offset Z.")
+
+        await event.respond("\n".join(lines))
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_synchro: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
 async def cmd_reset(event):
     if event.is_group or event.is_channel:
         return
@@ -2617,6 +2793,7 @@ def setup_handlers():
     client.add_event_handler(cmd_stats, events.NewMessage(pattern=r'^/stats$'))
     client.add_event_handler(cmd_compteur3, events.NewMessage(pattern=r'^/compteur3'))
     client.add_event_handler(cmd_setz, events.NewMessage(pattern=r'^/setz'))
+    client.add_event_handler(cmd_synchro, events.NewMessage(pattern=r'^/synchro$'))
 
     # Gestion
     client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
