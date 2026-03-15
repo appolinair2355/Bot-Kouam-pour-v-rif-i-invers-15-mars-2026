@@ -60,17 +60,6 @@ compteur3_active = True
 COMPTEUR3_Z = 3  # Valeur Z : offset numéro quand C3 seul atteint B
 COMPTEUR3_E = 3  # Valeur E : offset numéro quand C2 seul ou C2+C3 atteint B
 
-# NOUVEAU: Seuil B spécial pour costumes bloqués (minimum 7 par défaut)
-B_SPECIAL = 7
-
-# NOUVEAU: Costumes bloqués pour Distribution #R (suit -> bool)
-blocked_suits_for_distribution: Dict[str, bool] = {
-    '♦': False,  # 1 Carreau
-    '♠': False,  # 2 Pique
-    '♣': False,  # 3 Trèfle
-    '♥': False,  # 4 Cœur
-}
-
 # NOUVEAU: Compteur1 - Gestion des costumes présents consécutifs
 compteur1_trackers: Dict[str, 'Compteur1Tracker'] = {}
 compteur1_history: List[Dict] = []  # Historique des séries ≥3
@@ -89,11 +78,7 @@ prediction_history: List[Dict] = []
 prediction_queue: List[Dict] = []  # File ordonnée des prédictions en attente
 PREDICTION_SEND_AHEAD = 2  # Envoyer la prédiction quand canal source est à N-2
 
-# Valeur à ajouter pour la règle de distribution (configurable par admin)
-DISTRIBUTION_PLUS_VALUE = 5  # Valeur par défaut: +5
-
 # Canaux secondaires pour redirection
-DISTRIBUTION_CHANNEL_ID = None  # Canal spécifique pour Distribution #R
 COMPTEUR2_CHANNEL_ID = None     # Canal spécifique pour Compteur2
 
 # ============================================================================
@@ -775,7 +760,7 @@ async def send_prediction_to_channel(channel_id: int, game_number: int, suit: st
 
 async def send_prediction_multi_channel(game_number: int, suit: str, prediction_type: str = 'standard', reason_text: str = '') -> bool:
     """Envoie la prédiction au canal principal ET aux canaux secondaires selon le type."""
-    global last_prediction_time, last_prediction_number_sent, DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID
+    global last_prediction_time, last_prediction_number_sent, COMPTEUR2_CHANNEL_ID
     
     success = False
     
@@ -819,9 +804,7 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             # Envoyer aux canaux secondaires SEULEMENT si le canal principal a réussi
             # et stocker le message ID pour pouvoir mettre à jour le résultat plus tard
             secondary_channel_id = None
-            if prediction_type == 'distribution' and DISTRIBUTION_CHANNEL_ID:
-                secondary_channel_id = DISTRIBUTION_CHANNEL_ID
-            elif prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
+            if prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
                 secondary_channel_id = COMPTEUR2_CHANNEL_ID
             
             if secondary_channel_id:
@@ -1024,47 +1007,9 @@ def extract_first_two_groups(message: str) -> tuple:
         return groups[0], ""
     return "", ""
 
-def check_distribution_rule(game_number: int, message_text: str) -> Optional[tuple]:
-    """Vérifie la règle de distribution #R avec gestion des costumes bloqués."""
-    global DISTRIBUTION_PLUS_VALUE, blocked_suits_for_distribution
-    
-    # Ignorer si #R et #X ensemble
-    if '#R' in message_text and '#X' in message_text:
-        logger.info(f"🚫 #R et #X détectés ensemble au jeu #{game_number} - Distribution ignorée")
-        return None
-    
-    if '#R' not in message_text:
-        return None
-    
-    first_group, second_group = extract_first_two_groups(message_text)
-    
-    if not first_group and not second_group:
-        return None
-    
-    suits_first = set(get_suits_in_group(first_group))
-    suits_second = set(get_suits_in_group(second_group))
-    all_suits_found = suits_first.union(suits_second)
-    
-    all_suits = set(ALL_SUITS)
-    missing_suits = all_suits - all_suits_found
-    
-    if len(missing_suits) == 1:
-        missing_suit = list(missing_suits)[0]
-        
-        # NOUVEAU: Vérifier si ce costume est bloqué pour Distribution #R
-        if blocked_suits_for_distribution.get(missing_suit, False):
-            logger.info(f"🚫 {missing_suit} est BLOQUÉ pour Distribution #R - Prédiction ignorée")
-            return None
-        
-        prediction_number = game_number + DISTRIBUTION_PLUS_VALUE
-        logger.info(f"🎯 #R DÉTECTÉ: {missing_suit} manquant → Prédiction #{prediction_number} (base #{game_number} + {DISTRIBUTION_PLUS_VALUE})")
-        return (missing_suit, prediction_number)
-    
-    return None
-
 def update_compteur2(game_number: int, first_group: str):
-    """Met à jour Compteur2 avec gestion spéciale pour costumes bloqués."""
-    global compteur2_trackers, compteur2_seuil_B, B_SPECIAL, blocked_suits_for_distribution
+    """Met à jour Compteur2."""
+    global compteur2_trackers, compteur2_seuil_B
     
     suits_in_first = set(get_suits_in_group(first_group))
     
@@ -1084,7 +1029,7 @@ def get_all_counter_predictions(current_game: int) -> List[tuple]:
       2. C2 et C3 inverses à B    → prédit C2 manquant,   numéro = last_source + E
       3. C3 seul atteint B        → prédit inverse(C3),   numéro = last_source + Z
     """
-    global compteur2_trackers, compteur2_seuil_B, B_SPECIAL, blocked_suits_for_distribution
+    global compteur2_trackers, compteur2_seuil_B
     global compteur3_trackers, compteur3_seuil_B2, compteur3_active
     global COMPTEUR3_Z, COMPTEUR3_E, last_source_game_number
 
@@ -1097,7 +1042,7 @@ def get_all_counter_predictions(current_game: int) -> List[tuple]:
         if not tc2:
             continue
 
-        eff_B = max(B_SPECIAL, 7) if blocked_suits_for_distribution.get(suit_c2, False) else compteur2_seuil_B
+        eff_B = compteur2_seuil_B
         if tc2.counter < eff_B:
             continue
 
@@ -1185,7 +1130,7 @@ def get_synchro_status() -> List[dict]:
     Paires inverses : ♣↔❤️  et  ♦↔♠️
     Le suivi est toujours basé sur des numéros consécutifs finalisés (🔰/✅).
     """
-    global compteur2_trackers, compteur2_seuil_B, B_SPECIAL, blocked_suits_for_distribution
+    global compteur2_trackers, compteur2_seuil_B
     global compteur3_trackers, compteur3_seuil_B2
 
     pairs = [('♣', '♥'), ('♦', '♠')]
@@ -1197,7 +1142,7 @@ def get_synchro_status() -> List[dict]:
         if not tc2 or not tc3:
             continue
 
-        effective_B = B_SPECIAL if blocked_suits_for_distribution.get(suit_c2, False) else compteur2_seuil_B
+        effective_B = compteur2_seuil_B
 
         c2_ready = tc2.counter >= effective_B
         c3_ready = tc3.counter >= compteur3_seuil_B2
@@ -1395,17 +1340,7 @@ async def process_game_result(game_number: int, message_text: str):
         logger.info(f"⏸️ En pause, pas de nouvelle détection")
         return
     
-    # Distribution #R (avec gestion blocage)
-    distribution_result = check_distribution_rule(game_number, message_text)
-    if distribution_result:
-        suit, pred_num = distribution_result
-        suit_display = SUIT_DISPLAY.get(suit, suit)
-        dist_reason = f"Distribution #R au jeu #{game_number}, manque {suit_display}"
-        added = add_to_prediction_queue(pred_num, suit, 'distribution', dist_reason)
-        if added:
-            logger.info(f"🎯 Distribution: #{pred_num} en file d'attente")
-    
-    # Compteur2 (avec seuils adaptés) + validation Compteur3
+    # Compteur2 + validation Compteur3
     if compteur2_active:
         update_compteur2(game_number, first_group)
 
@@ -1630,131 +1565,6 @@ async def perform_full_reset(reason: str):
 # ============================================================================
 # COMMANDES ADMIN (NOUVELLES COMMANDES AJOUTÉES)
 # ============================================================================
-
-# NOUVEAU: Commande /block - Bloquer/débloquer costumes pour Distribution #R
-async def cmd_block(event):
-    global blocked_suits_for_distribution, B_SPECIAL
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    suit_map = {
-        '1': ('♦', '♦️ Carreau'),
-        '2': ('♠', '♠️ Pique'),
-        '3': ('♣', '♣️ Trèfle'),
-        '4': ('♥', '❤️ Cœur')
-    }
-    
-    try:
-        parts = event.message.message.split()
-        
-        # Afficher statut
-        if len(parts) == 1:
-            lines = [
-                "🚫 **BLOCAGE DISTRIBUTION #R**",
-                "",
-                "Costumes bloqués (uniquement Compteur2 autorisé):",
-                ""
-            ]
-            
-            any_blocked = False
-            for num, (suit, name) in suit_map.items():
-                status = "🔴 BLOQUÉ" if blocked_suits_for_distribution[suit] else "🟢 Libre"
-                lines.append(f"{num}. {name}: {status}")
-                if blocked_suits_for_distribution[suit]:
-                    any_blocked = True
-            
-            lines.append(f"\n📊 B spécial pour bloqués: **{B_SPECIAL}** (minimum requis)")
-            
-            lines.append(f"\n**Usage:**")
-            lines.append(f"`/block 1` - Bloquer ♦️ Carreau")
-            lines.append(f"`/block 2` - Bloquer ♠️ Pique")
-            lines.append(f"`/block 3` - Bloquer ♣️ Trèfle")
-            lines.append(f"`/block 4` - Bloquer ❤️ Cœur")
-            lines.append(f"`/block off` - Tout débloquer")
-            
-            await event.respond("\n".join(lines))
-            return
-        
-        arg = parts[1].lower()
-        
-        if arg == 'off':
-            # Débloquer tous
-            for suit in blocked_suits_for_distribution:
-                blocked_suits_for_distribution[suit] = False
-            await event.respond("✅ **Tous les costumes débloqués pour Distribution #R**")
-            logger.info("Admin débloque tous les costumes pour #R")
-            return
-        
-        if arg in suit_map:
-            suit, name = suit_map[arg]
-            blocked_suits_for_distribution[suit] = True
-            await event.respond(
-                f"🚫 **{name} BLOQUÉ pour Distribution #R**\n\n"
-                f"• Seul Compteur2 pourra prédire ce costume\n"
-                f"• B spécial requis: **{B_SPECIAL}** (au lieu de {compteur2_seuil_B})\n"
-                f"• Utilisez `/bspecial` pour changer le B spécial"
-            )
-            logger.info(f"Admin bloque {suit} ({name}) pour Distribution #R")
-        else:
-            await event.respond("❌ Usage: `/block [1-4/off]`\n1=♦️ 2=♠️ 3=♣️ 4=❤️")
-            
-    except Exception as e:
-        logger.error(f"Erreur cmd_block: {e}")
-        await event.respond(f"❌ Erreur: {e}")
-
-# NOUVEAU: Commande /bspecial - Définir le seuil B pour costumes bloqués
-async def cmd_bspecial(event):
-    global B_SPECIAL
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    try:
-        parts = event.message.message.split()
-        
-        if len(parts) == 1:
-            await event.respond(
-                f"📊 **SEUIL B SPÉCIAL**\n\n"
-                f"Valeur actuelle: **{B_SPECIAL}**\n\n"
-                f"Ce seuil s'applique aux costumes **bloqués** pour Distribution #R.\n"
-                f"Ils nécessiteront **{B_SPECIAL}** absences consécutives (Compteur2) "
-                f"au lieu de {compteur2_seuil_B}.\n\n"
-                f"**Usage:** `/bspecial [2-10]`\n"
-                f"Minimum recommandé: **7**"
-            )
-            return
-        
-        arg = parts[1]
-        
-        try:
-            b_val = int(arg)
-            if not 2 <= b_val <= 10:
-                await event.respond("❌ La valeur doit être entre 2 et 10")
-                return
-            
-            old_val = B_SPECIAL
-            B_SPECIAL = b_val
-            
-            await event.respond(
-                f"✅ **B spécial modifié: {old_val} → {b_val}**\n\n"
-                f"Les costumes bloqués nécessiteront maintenant **{b_val}** absences "
-                f"consécutives pour être prédits par Compteur2."
-            )
-            logger.info(f"Admin change B_SPECIAL: {old_val} → {b_val}")
-            
-        except ValueError:
-            await event.respond("❌ Usage: `/bspecial [2-10]`")
-            
-    except Exception as e:
-        logger.error(f"Erreur cmd_bspecial: {e}")
-        await event.respond(f"❌ Erreur: {e}")
 
 # NOUVEAU: Commande /compteur1 - Voir le statut actuel du Compteur1
 async def cmd_compteur1(event):
@@ -2034,47 +1844,6 @@ async def cmd_pauseadd(event):
         logger.error(f"Erreur cmd_pauseadd: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
-async def cmd_plus(event):
-    global DISTRIBUTION_PLUS_VALUE
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    try:
-        parts = event.message.message.split()
-        
-        if len(parts) == 1:
-            await event.respond(
-                f"➕ **CONFIGURATION DISTRIBUTION #R**\n\n"
-                f"Valeur actuelle: **+{DISTRIBUTION_PLUS_VALUE}**\n\n"
-                f"**Usage:** `/plus [1-20]`"
-            )
-            return
-        
-        arg = parts[1]
-        
-        try:
-            plus_val = int(arg)
-            if not 1 <= plus_val <= 20:
-                await event.respond("❌ La valeur doit être entre 1 et 20")
-                return
-            
-            old_val = DISTRIBUTION_PLUS_VALUE
-            DISTRIBUTION_PLUS_VALUE = plus_val
-            
-            await event.respond(f"✅ **Valeur modifiée: +{old_val} → +{plus_val}**")
-            logger.info(f"Admin change valeur distribution: +{old_val} → +{plus_val}")
-            
-        except ValueError:
-            await event.respond("❌ Usage: `/plus [1-20]`")
-            
-    except Exception as e:
-        logger.error(f"Erreur cmd_plus: {e}")
-        await event.respond(f"❌ Erreur: {e}")
-
 async def cmd_gap(event):
     global MIN_GAP_BETWEEN_PREDICTIONS
     
@@ -2114,62 +1883,6 @@ async def cmd_gap(event):
             
     except Exception as e:
         logger.error(f"Erreur cmd_gap: {e}")
-        await event.respond(f"❌ Erreur: {e}")
-
-async def cmd_canal_distribution(event):
-    global DISTRIBUTION_CHANNEL_ID
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    try:
-        parts = event.message.message.split()
-        
-        if len(parts) == 1:
-            if DISTRIBUTION_CHANNEL_ID:
-                await event.respond(
-                    f"🎯 **CANAL DISTRIBUTION #R**\n\n"
-                    f"✅ Actif: `{DISTRIBUTION_CHANNEL_ID}`\n\n"
-                    f"**Usage:** `/canaldistribution [ID]` ou `/canaldistribution off`"
-                )
-            else:
-                await event.respond(
-                    f"🎯 **CANAL DISTRIBUTION #R**\n\n"
-                    f"❌ Inactif\n\n"
-                    f"**Usage:** `/canaldistribution [ID]`"
-                )
-            return
-        
-        arg = parts[1].lower()
-        
-        if arg == 'off':
-            old_id = DISTRIBUTION_CHANNEL_ID
-            DISTRIBUTION_CHANNEL_ID = None
-            await event.respond(f"❌ **Canal Distribution désactivé** (était: `{old_id}`)")
-            logger.info(f"Admin désactive canal distribution")
-            return
-        
-        try:
-            new_id = int(arg)
-            channel_entity = await resolve_channel(new_id)
-            if not channel_entity:
-                await event.respond(f"❌ Canal `{new_id}` inaccessible")
-                return
-            
-            old_id = DISTRIBUTION_CHANNEL_ID
-            DISTRIBUTION_CHANNEL_ID = new_id
-            
-            await event.respond(f"✅ **Canal Distribution: {old_id} → {new_id}**")
-            logger.info(f"Admin change canal distribution: {old_id} → {new_id}")
-            
-        except ValueError:
-            await event.respond("❌ Usage: `/canaldistribution [ID]` ou `/canaldistribution off`")
-            
-    except Exception as e:
-        logger.error(f"Erreur cmd_canal_distribution: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_canal_compteur2(event):
@@ -2229,7 +1942,7 @@ async def cmd_canal_compteur2(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_canaux(event):
-    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID, SOURCE_CHANNEL_ID
+    global COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID, SOURCE_CHANNEL_ID
     
     if event.is_group or event.is_channel:
         return
@@ -2243,7 +1956,6 @@ async def cmd_canaux(event):
         f"📥 **Source:** `{SOURCE_CHANNEL_ID}`",
         f"📤 **Principal:** `{PREDICTION_CHANNEL_ID}`",
         "",
-        f"🎯 **Distribution #R:** {f'`{DISTRIBUTION_CHANNEL_ID}`' if DISTRIBUTION_CHANNEL_ID else '❌'}",
         f"📊 **Compteur2:** {f'`{COMPTEUR2_CHANNEL_ID}`' if COMPTEUR2_CHANNEL_ID else '❌'}",
     ]
     
@@ -2279,7 +1991,7 @@ async def cmd_queue(event):
                 pred_type = pred['type']
                 pred_num = pred['game_number']
                 
-                type_str = "🎯Dist" if pred_type == 'distribution' else "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🔁SYN" if pred_type == 'synchro_inverse' else "🤖"
+                type_str = "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🔁SYN" if pred_type == 'synchro_inverse' else "🤖"
 
                 send_threshold = pred_num - PREDICTION_SEND_AHEAD
                 
@@ -2387,7 +2099,7 @@ async def cmd_history(event):
             status = pred['status']
             pred_time = pred['predicted_at'].strftime('%H:%M:%S')
             
-            rule = "🎯#R" if pred.get('type') == 'distribution' else "📊C2" if pred.get('type') == 'compteur2' else "🔄C3⚡" if pred.get('type') == 'compteur3_inverse' else "🔁SYN" if pred.get('type') == 'synchro_inverse' else "🤖"
+            rule = "📊C2" if pred.get('type') == 'compteur2' else "🔄C3⚡" if pred.get('type') == 'compteur3_inverse' else "🔁SYN" if pred.get('type') == 'synchro_inverse' else "🤖"
             emoji = {'en_cours': '🎰', 'gagne_r0': '🏆', 'gagne_r1': '🏆', 'gagne_r2': '🏆', 'perdu': '💔'}.get(status, '❓')
             
             lines.append(f"{i}. {emoji} #{pred['predicted_game']} {suit} | {rule} | {status}")
@@ -2396,8 +2108,8 @@ async def cmd_history(event):
     await event.respond("\n".join(lines))
 
 async def cmd_status(event):
-    global compteur2_active, compteur2_seuil_B, DISTRIBUTION_PLUS_VALUE
-    global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, pause_active, pause_counter, PREDICTIONS_BEFORE_PAUSE, PAUSE_CYCLE, B_SPECIAL
+    global compteur2_active, compteur2_seuil_B
+    global COMPTEUR2_CHANNEL_ID, pause_active, pause_counter, PREDICTIONS_BEFORE_PAUSE, PAUSE_CYCLE
     global compteur3_active, compteur3_seuil_B2, COMPTEUR3_Z
 
     if event.is_group or event.is_channel:
@@ -2410,17 +2122,12 @@ async def cmd_status(event):
     compteur3_str = "✅ ON" if compteur3_active else "❌ OFF"
     pause_str = "🟢 ACTIVE" if pause_active else "🔴 INACTIVE"
 
-    blocked_count = sum(1 for v in blocked_suits_for_distribution.values() if v)
-
     now = datetime.now()
 
     lines = [
         "📊 **STATUT COMPLET**",
         "",
-        f"➕ Distribution: +{DISTRIBUTION_PLUS_VALUE}",
         f"📊 Compteur2: {compteur2_str} (B={compteur2_seuil_B})",
-        f"🔒 B spécial (bloqués): {B_SPECIAL}",
-        f"🚫 Costumes bloqués: {blocked_count}/4",
         f"🔄 Compteur3: {compteur3_str} (B2={compteur3_seuil_B2} | Z={COMPTEUR3_Z})",
         f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}",
         f"⏸️ Pause: {pause_str} ({pause_counter}/{PREDICTIONS_BEFORE_PAUSE})",
@@ -2428,7 +2135,6 @@ async def cmd_status(event):
         f"📋 File: {len(prediction_queue)} | Actives: {len(pending_predictions)}",
         f"🎮 Canal: #{current_game_number}",
         "",
-        f"🎯 Distrib: {DISTRIBUTION_CHANNEL_ID or '❌'}",
         f"📊 C2: {COMPTEUR2_CHANNEL_ID or '❌'}",
     ]
     
@@ -2462,7 +2168,6 @@ async def cmd_informations(event):
         B = compteur2_seuil_B
 
         TYPE_LABELS = {
-            'distribution':   '🎯 Distribution #R',
             'compteur2':      '📊 C2 seul → inverse(C2)',
             'compteur2_c3':   '📊+🔄 C2+C3 → costume C2',
             'compteur3_seul': '🔁 C3 seul → inverse(C3)',
@@ -2612,13 +2317,8 @@ async def cmd_help(event):
     help_text = f"""📖 **BACCARAT AI - COMMANDES**
 
 **⚙️ Configuration:**
-`/plus [1-20]` - Valeur #R (+{DISTRIBUTION_PLUS_VALUE})
 `/gap [2-10]` - Écart min ({MIN_GAP_BETWEEN_PREDICTIONS})
-
-**🔒 Blocage & Seuils:**
-`/block [1-4/off]` - Bloquer costume pour #R (1=♦️ 2=♠️ 3=♣️ 4=❤️)
-`/bspecial [2-10]` - B minimum pour costumes bloqués ({B_SPECIAL})
-`/compteur2 [B/on/off/reset]` - Gérer Compteur2 (B normal)
+`/compteur2 [B/on/off/reset]` - Gérer Compteur2
 
 **📊 Compteurs:**
 `/compteur1` - Voir Compteur1 (présences)
@@ -2629,7 +2329,6 @@ async def cmd_help(event):
 `/synchro` - Voir synchro C2+C3 inverses (♣↔❤️ / ♦↔♠️)
 
 **📡 Canaux:**
-`/canaldistribution [ID/off]`
 `/canalcompteur2 [ID/off]`
 `/canaux` - Voir config
 
@@ -2684,7 +2383,7 @@ async def cmd_pending(event):
             sent_time = pred.get('sent_time')
             pred_type = pred.get('type', 'standard')
             
-            type_str = "🎯#R" if pred_type == 'distribution' else "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🔁SYN" if pred_type == 'synchro_inverse' else "🤖"
+            type_str = "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🔁SYN" if pred_type == 'synchro_inverse' else "🤖"
             
             age_str = ""
             timeout_str = ""
@@ -2960,15 +2659,9 @@ async def cmd_reset(event):
 
 def setup_handlers():
     # Configuration
-    client.add_event_handler(cmd_plus, events.NewMessage(pattern=r'^/plus'))
     client.add_event_handler(cmd_gap, events.NewMessage(pattern=r'^/gap'))
     
-    # NOUVEAU: Blocage et seuils
-    client.add_event_handler(cmd_block, events.NewMessage(pattern=r'^/block'))
-    client.add_event_handler(cmd_bspecial, events.NewMessage(pattern=r'^/bspecial'))
-    
     # Canaux
-    client.add_event_handler(cmd_canal_distribution, events.NewMessage(pattern=r'^/canaldistribution'))
     client.add_event_handler(cmd_canal_compteur2, events.NewMessage(pattern=r'^/canalcompteur2'))
     client.add_event_handler(cmd_canaux, events.NewMessage(pattern=r'^/canaux$'))
     
@@ -3044,12 +2737,9 @@ async def main():
         await site.start()
         
         logger.info(f"🌐 Web server port {PORT}")
-        logger.info(f"➕ Distribution: +{DISTRIBUTION_PLUS_VALUE}")
         logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
         logger.info(f"⏸️ Pause cycle: {PAUSE_CYCLE} min")
         logger.info(f"📡 Multi-canaux: ACTIVE")
-        logger.info(f"🚫 #R+#X ignorés ensemble")
-        logger.info(f"🔒 Système de blocage costumes: ACTIVE")
         logger.info(f"🎯 Compteur1 (présences): ACTIVE")
         logger.info(f"🔄 Compteur3 (2ème groupe B2={compteur3_seuil_B2} Z={COMPTEUR3_Z}): ACTIVE")
         logger.info(f"✅ Système de pause corrigé")
