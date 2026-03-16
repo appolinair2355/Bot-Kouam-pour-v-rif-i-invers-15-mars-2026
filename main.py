@@ -57,8 +57,12 @@ compteur2_active = True
 compteur3_trackers: Dict[str, 'Compteur3Tracker'] = {}
 compteur3_seuil_B2 = 3  # Seuil B2 par défaut
 compteur3_active = True
-COMPTEUR3_Z = 3  # Valeur Z : offset numéro quand C3 seul atteint B
-COMPTEUR3_E = 3  # Valeur E : offset numéro quand C2 seul ou C2+C3 atteint B
+COMPTEUR3_Z = 3  # Valeur Z : offset numéro quand C3 seul atteint B (mode c3only)
+COMPTEUR3_E = 3  # Valeur E : offset numéro quand C2 seul atteint B (mode c2only)
+COMPTEUR3_F = 3  # Valeur F : offset numéro quand C2+C3 inverses (mode c2c3inverse)
+
+# Mode de prédiction : 'all' (défaut), 'c2only', 'c3only', 'c2c3inverse'
+prediction_mode = 'all'
 
 # NOUVEAU: Compteur1 - Gestion des costumes présents consécutifs
 compteur1_trackers: Dict[str, 'Compteur1Tracker'] = {}
@@ -687,7 +691,7 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
     if status == 'en_cours':
         verif_parts = []
         
-        for i in range(3):
+        for i in range(4):
             check_num = game_number + i
             
             if current_check == check_num:
@@ -782,7 +786,7 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             'status': 'sending',       # placeholder — bloque les vérifications concurrentes
             'type': prediction_type,
             'sent_time': datetime.now(),
-            'verification_games': [game_number, game_number + 1, game_number + 2],
+            'verification_games': [game_number, game_number + 1, game_number + 2, game_number + 3],
             'verified_games': [],
             'found_at': None,
             'rattrapage': 0,
@@ -798,7 +802,7 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             last_prediction_time = datetime.now()
             pending_predictions[game_number]['message_id'] = msg_id
             pending_predictions[game_number]['status'] = 'en_cours'
-            add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2], prediction_type, reason_text)
+            add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2, game_number + 3], prediction_type, reason_text)
             success = True
             
             # Envoyer aux canaux secondaires SEULEMENT si le canal principal a réussi
@@ -981,16 +985,16 @@ async def check_prediction_result(game_number: int, first_group: str) -> bool:
                 update_prediction_in_history(original_game, target_suit, game_number, first_group, rattrapage, f'gagne_r{rattrapage}')
                 return True
             else:
-                if rattrapage < 2:
+                if rattrapage < 3:
                     pred['rattrapage'] = rattrapage + 1
                     next_check = original_game + rattrapage + 1
                     logger.info(f"❌ R{rattrapage} échoué, attente #{next_check}")
                     await update_prediction_progress(original_game, next_check)
                     return False
                 else:
-                    logger.info(f"❌ R2 échoué, prédiction perdue")
-                    await update_prediction_message(original_game, 'perdu', 2)
-                    update_prediction_in_history(original_game, target_suit, game_number, first_group, 2, 'perdu')
+                    logger.info(f"❌ R3 échoué, prédiction perdue")
+                    await update_prediction_message(original_game, 'perdu', 3)
+                    update_prediction_in_history(original_game, target_suit, game_number, first_group, 3, 'perdu')
                     return False
     
     return False
@@ -1024,85 +1028,107 @@ def update_compteur2(game_number: int, first_group: str):
 def get_all_counter_predictions(current_game: int) -> List[tuple]:
     """Logique unifiée de prédiction C2/C3.
 
-    Règles :
-      1. C2 seul atteint B        → prédit inverse(C2),   numéro = last_source + E
-      2. C2 et C3 inverses à B    → prédit C2 manquant,   numéro = last_source + E
-      3. C3 seul atteint B        → prédit inverse(C3),   numéro = last_source + Z
+    Chaque prédiction retourne un tuple : (suit, pred_number, pred_type, reason, send_at)
+    où send_at = numéro de détection (base). La prédiction est ENVOYÉE dès que le
+    canal source atteint send_at, et VÉRIFIÉE à pred_number.
+
+    Modes :
+      'c2only'      → C2 atteint B → prédit inverse(C2) au numéro (base + E)
+      'c3only'      → C3 atteint B → prédit inverse(C3) au numéro (base + Z)
+      'c2c3inverse' → C2 atteint B ET C3 est inverse de C2 → prédit C2 manquant au numéro (base + F)
+      'all'         → toutes les règles ci-dessus simultanément
     """
     global compteur2_trackers, compteur2_seuil_B
     global compteur3_trackers, compteur3_seuil_B2, compteur3_active
-    global COMPTEUR3_Z, COMPTEUR3_E, last_source_game_number
+    global COMPTEUR3_Z, COMPTEUR3_E, COMPTEUR3_F, last_source_game_number, prediction_mode
 
     ready = []
     base = last_source_game_number if last_source_game_number > 0 else current_game
+    send_at = base  # prédiction envoyée IMMÉDIATEMENT (dès le jeu de détection)
 
-    # ── BOUCLE 1 : costumes C2 ayant atteint leur seuil ──────────────────
-    for suit_c2 in ALL_SUITS:
-        tc2 = compteur2_trackers.get(suit_c2)
-        if not tc2:
-            continue
+    # Ensembles pour éviter de consommer deux fois le même costume
+    consumed_c2: set = set()
+    consumed_c3: set = set()
 
-        eff_B = compteur2_seuil_B
-        if tc2.counter < eff_B:
-            continue
+    # ── ÉTAPE 1 : C2+C3 INVERSES (priorité maximale en mode 'all') ──────────
+    # Un costume C2 manquant dont l'inverse manque aussi en C3 → Règle F
+    if prediction_mode in ('c2c3inverse', 'all') and compteur3_active:
+        for suit_c2 in ALL_SUITS:
+            tc2 = compteur2_trackers.get(suit_c2)
+            if not tc2 or tc2.counter < compteur2_seuil_B:
+                continue
+            inv_c2 = get_suit_inverse(suit_c2)
+            if not inv_c2:
+                continue
+            tc3_inv = compteur3_trackers.get(inv_c2)
+            if not tc3_inv or tc3_inv.counter < compteur3_seuil_B2:
+                continue
 
-        c2_display = SUIT_DISPLAY.get(suit_c2, suit_c2)
-        streak_start = tc2.streak_start_game
-        interval_end = streak_start + eff_B - 1
-
-        inv_c2 = get_suit_inverse(suit_c2)
-        tc3_inv = compteur3_trackers.get(inv_c2) if (inv_c2 and compteur3_active) else None
-        c3_inv_ready = tc3_inv is not None and tc3_inv.counter >= compteur3_seuil_B2
-
-        if c3_inv_ready and inv_c2:
-            # Règle 2 : C2 + C3 inverses → prédit C2 manquant, offset E
+            eff_B = compteur2_seuil_B
+            c2_display = SUIT_DISPLAY.get(suit_c2, suit_c2)
             inv_display = SUIT_DISPLAY.get(inv_c2, inv_c2)
+            streak_start = tc2.streak_start_game
+            interval_end = streak_start + eff_B - 1
             c3_start = tc3_inv.streak_start_game
             c3_interval_end = c3_start + compteur3_seuil_B2 - 1
-            pred_number = base + COMPTEUR3_E
+            pred_number = base + COMPTEUR3_F
             predicted_suit = suit_c2
             pred_type = 'compteur2_c3'
             reason = (
                 f"C2 manque {c2_display} [#{streak_start}→#{interval_end}] ({eff_B} absences)\n"
                 f"C3 manque {inv_display} [#{c3_start}→#{c3_interval_end}] ({compteur3_seuil_B2} absences)\n"
                 f"C2 et C3 inverses confirmés : {c2_display} ↔ {inv_display}\n"
-                f"E = {COMPTEUR3_E} → Costume C2 prédit ({c2_display})"
+                f"F = {COMPTEUR3_F} → Prédiction #{pred_number} — Costume C2 manquant : {c2_display}"
             )
             logger.info(
-                f"📊+🔄 C2+C3 inverses: {suit_c2} ↔ {inv_c2} "
-                f"→ Prédiction #{pred_number} ({predicted_suit}) [E={COMPTEUR3_E}]"
+                f"📊+🔄 [C2C3-INV] {suit_c2} ↔ {inv_c2} → #{pred_number} [F={COMPTEUR3_F}, send_at=#{send_at}]"
             )
+            tc2.reset(current_game)
             tc3_inv.reset(current_game)
-        else:
-            # Règle 1 : C2 seul → prédit inverse(C2), offset E
+            consumed_c2.add(suit_c2)
+            consumed_c3.add(inv_c2)
+            ready.append((predicted_suit, pred_number, pred_type, reason, send_at))
+
+    # ── ÉTAPE 2 : C2 SEUL → inverse(C2) à base+E ───────────────────────────
+    if prediction_mode in ('c2only', 'all'):
+        for suit_c2 in ALL_SUITS:
+            if suit_c2 in consumed_c2:
+                continue
+            tc2 = compteur2_trackers.get(suit_c2)
+            if not tc2 or tc2.counter < compteur2_seuil_B:
+                continue
+
+            eff_B = compteur2_seuil_B
+            c2_display = SUIT_DISPLAY.get(suit_c2, suit_c2)
+            streak_start = tc2.streak_start_game
+            interval_end = streak_start + eff_B - 1
+            inv_c2 = get_suit_inverse(suit_c2)
             inv_display = SUIT_DISPLAY.get(inv_c2, inv_c2) if inv_c2 else '?'
             pred_number = base + COMPTEUR3_E
             predicted_suit = inv_c2 if inv_c2 else suit_c2
             pred_type = 'compteur2'
             reason = (
                 f"C2 manque {c2_display} [#{streak_start}→#{interval_end}] ({eff_B} absences)\n"
-                f"C3 sans manque correspondant\n"
-                f"E = {COMPTEUR3_E} → Inverse de C2 prédit ({inv_display})"
+                f"E = {COMPTEUR3_E} → Prédiction #{pred_number} — Inverse de C2 : {inv_display}"
             )
             logger.info(
-                f"📊 C2 seul: {suit_c2} → inverse {inv_c2} "
-                f"→ Prédiction #{pred_number} [E={COMPTEUR3_E}]"
+                f"📊 [C2ONLY] {suit_c2} → inverse {inv_c2} → #{pred_number} [E={COMPTEUR3_E}, send_at=#{send_at}]"
             )
+            tc2.reset(current_game)
+            consumed_c2.add(suit_c2)
+            ready.append((predicted_suit, pred_number, pred_type, reason, send_at))
 
-        ready.append((predicted_suit, pred_number, pred_type, reason))
-        tc2.reset(current_game)
-
-    # ── BOUCLE 2 : costumes C3 ayant atteint leur seuil (non consommés) ──
-    if compteur3_active:
+    # ── ÉTAPE 3 : C3 SEUL → inverse(C3) à base+Z ───────────────────────────
+    if prediction_mode in ('c3only', 'all') and compteur3_active:
         for suit_c3 in ALL_SUITS:
+            if suit_c3 in consumed_c3:
+                continue
             tc3 = compteur3_trackers.get(suit_c3)
-            # Si tc3 a été reset en boucle 1, son counter est 0 → ignoré automatiquement
             if not tc3 or tc3.counter < compteur3_seuil_B2:
                 continue
 
-            # Règle 3 : C3 seul → prédit inverse(C3), offset Z
-            inv_c3 = get_suit_inverse(suit_c3)
             c3_display = SUIT_DISPLAY.get(suit_c3, suit_c3)
+            inv_c3 = get_suit_inverse(suit_c3)
             inv_display = SUIT_DISPLAY.get(inv_c3, inv_c3) if inv_c3 else '?'
             c3_start = tc3.streak_start_game
             c3_interval_end = c3_start + compteur3_seuil_B2 - 1
@@ -1111,15 +1137,14 @@ def get_all_counter_predictions(current_game: int) -> List[tuple]:
             pred_type = 'compteur3_seul'
             reason = (
                 f"C3 manque {c3_display} [#{c3_start}→#{c3_interval_end}] ({compteur3_seuil_B2} absences)\n"
-                f"C2 inverse absent (sous seuil)\n"
-                f"Z = {COMPTEUR3_Z} → Inverse de C3 prédit ({inv_display})"
+                f"Z = {COMPTEUR3_Z} → Prédiction #{pred_number} — Inverse de C3 : {inv_display}"
             )
             logger.info(
-                f"🔁 C3 seul: {suit_c3} → inverse {inv_c3} "
-                f"→ Prédiction #{pred_number} [Z={COMPTEUR3_Z}]"
+                f"🔁 [C3ONLY] {suit_c3} → inverse {inv_c3} → #{pred_number} [Z={COMPTEUR3_Z}, send_at=#{send_at}]"
             )
             tc3.reset(current_game)
-            ready.append((predicted_suit, pred_number, pred_type, reason))
+            consumed_c3.add(suit_c3)
+            ready.append((predicted_suit, pred_number, pred_type, reason, send_at))
 
     return ready
 
@@ -1203,7 +1228,13 @@ def can_accept_prediction(pred_number: int) -> bool:
     
     return True
 
-def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str, reason_text: str = '') -> bool:
+def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str, reason_text: str = '', send_at: int = None) -> bool:
+    """Ajoute une prédiction à la file.
+    
+    send_at : numéro du jeu source à partir duquel envoyer la prédiction.
+              Par défaut = game_number (envoi quand la source atteint le jeu prédit).
+              Pour envoi immédiat : passer send_at = base (numéro de détection).
+    """
     global prediction_queue, pause_active
     
     if pause_active:
@@ -1219,21 +1250,32 @@ def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str, r
         logger.info(f"❌ Prédiction #{game_number} rejetée - écart insuffisant")
         return False
     
+    effective_send_at = send_at if send_at is not None else game_number
+    
     new_pred = {
         'game_number': game_number,
         'suit': suit,
         'type': prediction_type,
         'reason_text': reason_text,
+        'send_at': effective_send_at,
         'added_at': datetime.now()
     }
     
     prediction_queue.append(new_pred)
     prediction_queue.sort(key=lambda x: x['game_number'])
     
-    logger.info(f"📥 Prédiction #{game_number} ({suit}) ajoutée à la file. Total: {len(prediction_queue)}")
+    logger.info(f"📥 Prédiction #{game_number} ({suit}) ajoutée — envoi dès jeu #{effective_send_at}. Total: {len(prediction_queue)}")
     return True
 
 async def process_prediction_queue(current_game: int):
+    """Traite la file d'attente de prédictions.
+
+    Nouvelle logique (E/Z/F imposent le lancement) :
+      - send_at  : jeu source à partir duquel envoyer la prédiction (= jeu de détection)
+      - game_number : jeu cible à vérifier (= detection + E/Z/F)
+      - Expirée  : si current_game > game_number (jeu cible déjà passé)
+      - Envoyer  : si current_game >= send_at (moment de lancement atteint) ET pas de pending
+    """
     global prediction_queue, pending_predictions, pause_active
     
     if pause_active:
@@ -1250,18 +1292,17 @@ async def process_prediction_queue(current_game: int):
     for pred in list(prediction_queue):
         pred_number = pred['game_number']
         suit = pred['suit']
-        pred_type = pred['type']
+        send_at = pred.get('send_at', pred_number)
         
-        # RÈGLE 2: Prédiction expirée — le moment optimal est passé (moins de PREDICTION_SEND_AHEAD jeux restants)
-        if current_game > pred_number - PREDICTION_SEND_AHEAD:
-            logger.warning(f"⏰ Prédiction #{pred_number} ({suit}) EXPIRÉE — canal à #{current_game}, trop tard")
+        # RÈGLE 2: Prédiction expirée — le jeu cible est déjà passé
+        if current_game > pred_number:
+            logger.warning(f"⏰ Prédiction #{pred_number} ({suit}) EXPIRÉE — canal à #{current_game}, jeu cible dépassé")
             to_remove.append(pred)
             continue
         
-        # RÈGLE 3: Envoyer uniquement quand on est exactement au bon moment (N-PREDICTION_SEND_AHEAD)
-        if current_game == pred_number - PREDICTION_SEND_AHEAD:
+        # RÈGLE 3: Envoyer quand le canal source atteint ou dépasse send_at (E/Z/F impose le lancement)
+        if current_game >= send_at and to_send is None:
             to_send = pred
-            break
     
     # Nettoyer les expirées
     for pred in to_remove:
@@ -1273,6 +1314,7 @@ async def process_prediction_queue(current_game: int):
         pred_number = to_send['game_number']
         suit = to_send['suit']
         pred_type = to_send['type']
+        send_at = to_send.get('send_at', pred_number)
         
         # Vérification finale juste avant envoi (protection race condition)
         if pause_active:
@@ -1283,7 +1325,7 @@ async def process_prediction_queue(current_game: int):
             return
         
         reason_text = to_send.get('reason_text', '')
-        logger.info(f"📤 Envoi depuis file: #{pred_number} (canal à #{current_game})")
+        logger.info(f"📤 Envoi depuis file: #{pred_number} (canal à #{current_game}, send_at=#{send_at})")
         success = await send_prediction_multi_channel(pred_number, suit, pred_type, reason_text)
         
         if success:
@@ -1330,37 +1372,37 @@ async def process_game_result(game_number: int, message_text: str):
     # NOUVEAU: Mettre à jour Compteur1 (présences consécutives)
     update_compteur1(game_number, first_group)
     
-    # Vérification des prédictions existantes
+    # 1. Vérification des prédictions existantes (libère pending si terminé)
     await check_prediction_result(game_number, first_group)
     
-    # Traiter la file d'attente
-    await process_prediction_queue(game_number)
-    
-    if pause_active:
+    if not pause_active:
+        # 2. Mise à jour des compteurs
+        if compteur2_active:
+            update_compteur2(game_number, first_group)
+
+        if compteur3_active and len(groups) >= 2:
+            second_group = groups[1]
+            update_compteur3(game_number, second_group)
+
+        # 3. Générer et mettre en file les nouvelles prédictions (avec send_at = jeu de détection)
+        if compteur2_active or compteur3_active:
+            all_preds = get_all_counter_predictions(game_number)
+            type_labels_log = {
+                'compteur2':      '📊 C2 seul (inverse)',
+                'compteur2_c3':   '📊+🔄 C2+C3 (costume C2)',
+                'compteur3_seul': '🔁 C3 seul (inverse)',
+            }
+            for predicted_suit, pred_num, pred_type, reason, send_at in all_preds:
+                added = add_to_prediction_queue(pred_num, predicted_suit, pred_type, reason, send_at)
+                if added:
+                    label = type_labels_log.get(pred_type, pred_type)
+                    logger.info(f"{label}: #{pred_num} ({predicted_suit}) → envoi dès jeu #{send_at}")
+    else:
         logger.info(f"⏸️ En pause, pas de nouvelle détection")
-        return
-    
-    # Compteur2 + validation Compteur3
-    if compteur2_active:
-        update_compteur2(game_number, first_group)
 
-    # Compteur3 (2ème groupe)
-    if compteur3_active and len(groups) >= 2:
-        second_group = groups[1]
-        update_compteur3(game_number, second_group)
-
-    if compteur2_active or compteur3_active:
-        all_preds = get_all_counter_predictions(game_number)
-        for predicted_suit, pred_num, pred_type, reason in all_preds:
-            added = add_to_prediction_queue(pred_num, predicted_suit, pred_type, reason)
-            if added:
-                type_labels_log = {
-                    'compteur2':    '📊 C2 seul (inverse)',
-                    'compteur2_c3': '📊+🔄 C2+C3 (costume C2)',
-                    'compteur3_seul': '🔁 C3 seul (inverse)',
-                }
-                label = type_labels_log.get(pred_type, pred_type)
-                logger.info(f"{label}: #{pred_num} ({predicted_suit}) en file d'attente")
+    # 4. Traiter la file d'attente APRÈS ajout des nouvelles prédictions
+    #    → les prédictions avec send_at = game_number sont envoyées immédiatement
+    await process_prediction_queue(game_number)
 
 async def handle_message(event, is_edit: bool = False):
     try:
@@ -1514,7 +1556,7 @@ async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time, waiting_finalization
     global last_prediction_number_sent, compteur2_trackers, prediction_queue
     global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
-    global compteur1_trackers, compteur1_history, compteur3_trackers
+    global compteur1_trackers, compteur1_history, compteur3_trackers, prediction_history
 
     stats = len(pending_predictions)
     queue_stats = len(prediction_queue)
@@ -1523,6 +1565,50 @@ async def perform_full_reset(reason: str):
     for tracker in compteur1_trackers.values():
         if tracker.counter >= MIN_CONSECUTIVE_FOR_STATS:
             save_compteur1_series(tracker.suit, tracker.counter, tracker.start_game, tracker.last_game)
+
+    # Envoyer le PDF des prédictions à l'admin avant de tout effacer
+    if prediction_history and ADMIN_ID and ADMIN_ID != 0:
+        try:
+            total = len(prediction_history)
+            nb_gagne = sum(1 for p in prediction_history if 'gagne' in p.get('status', ''))
+            nb_perdu = sum(1 for p in prediction_history if p.get('status') == 'perdu')
+            nb_cours = sum(1 for p in prediction_history if p.get('status') == 'en_cours')
+            status_str = "✅ ON" if compteur2_active else "❌ OFF"
+            B = compteur2_seuil_B
+            header_lines = [
+                f"📊 RESET — Rapport final avant reset",
+                f"Raison : {reason}",
+                f"",
+                f"Total : {total}  |  🏆 {nb_gagne} gagnée(s)  |  💔 {nb_perdu} perdue(s)  |  🎰 {nb_cours} en cours",
+                f"",
+            ]
+            TYPE_LABELS_PDF = {
+                'compteur2':      'C2 seul -> inverse(C2)',
+                'compteur2_c3':   'C2+C3 -> costume C2',
+                'compteur3_seul': 'C3 seul -> inverse(C3)',
+                'compteur3_inverse': 'C3 Inverse (legacy)',
+                'synchro_inverse':   'Synchro Inverse (legacy)',
+            }
+            STATUS_ICONS_PDF = {
+                'en_cours':  '[?] En cours',
+                'gagne_r0':  '[W] Gagne R0',
+                'gagne_r1':  '[W] Gagne R1',
+                'gagne_r2':  '[W] Gagne R2',
+                'gagne_r3':  '[W] Gagne R3',
+                'gagne':     '[W] Gagne',
+                'perdu':     '[L] Perdu',
+            }
+            await _generate_and_send_pdf(
+                lambda: client.get_input_entity(ADMIN_ID),
+                prediction_history,
+                header_lines,
+                total, nb_gagne, nb_perdu, nb_cours,
+                status_str, B,
+                STATUS_ICONS_PDF, TYPE_LABELS_PDF
+            )
+            logger.info(f"✅ PDF rapport final envoyé à l'admin avant reset")
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi PDF pré-reset: {e}")
 
     if pause_active:
         pause_active = False
@@ -1551,6 +1637,7 @@ async def perform_full_reset(reason: str):
     pending_predictions.clear()
     waiting_finalization.clear()
     prediction_queue.clear()
+    prediction_history.clear()
     last_prediction_time = None
     last_prediction_number_sent = 0
     suit_block_until.clear()
@@ -2153,6 +2240,82 @@ async def cmd_status(event):
     
     await event.respond("\n".join(lines))
 
+async def _generate_and_send_pdf(get_sender_fn, preds, header_lines, total, nb_gagne, nb_perdu, nb_cours, status_str, B, STATUS_ICONS, TYPE_LABELS):
+    """Génère un PDF des prédictions et l'envoie via Telegram."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+
+    def clean(s):
+        for old, new in [
+            ('♠️','Pique'), ('❤️','Coeur'), ('♦️','Carreau'), ('♣️','Trefle'),
+            ('♠','Pique'), ('♥','Coeur'), ('♦','Carreau'), ('♣','Trefle'),
+            ('🏆','[W]'), ('💔','[L]'), ('🎰','[?]'), ('🔄',''), ('🔁',''),
+            ('📊',''), ('🎯',''), ('▸','>'), ('#','No.'),
+        ]:
+            s = s.replace(old, new)
+        # Supprimer les emojis restants (caractères hors ASCII de base)
+        s = ''.join(c if ord(c) < 0x2600 else '?' for c in s)
+        return s.strip()
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=15*mm, leftMargin=15*mm,
+        topMargin=15*mm, bottomMargin=15*mm
+    )
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('H1', parent=styles['Heading1'], fontSize=13, spaceAfter=4)
+    h2 = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=10, spaceAfter=3)
+    norm = ParagraphStyle('Norm', parent=styles['Normal'], fontSize=9, spaceAfter=2)
+    indent = ParagraphStyle('Ind', parent=styles['Normal'], fontSize=9, spaceAfter=2, leftIndent=12)
+
+    story = []
+    story.append(Paragraph(f"Baccarat AI - Predictions ({total} total)", h1))
+    story.append(Paragraph(f"Statut : {clean(status_str)} | B={B}", norm))
+    story.append(Paragraph("Inverses : Pique<->Carreau  Coeur<->Trefle", norm))
+    story.append(Paragraph(f"Total {total} | Gagne {nb_gagne} | Perdu {nb_perdu} | En cours {nb_cours}", norm))
+    story.append(Spacer(1, 5*mm))
+
+    for i, pred in enumerate(preds, 1):
+        suit_disp = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+        status_txt = STATUS_ICONS.get(pred['status'], '?')
+        pred_type = TYPE_LABELS.get(pred['type'], pred['type'])
+        reason = pred.get('reason_text', '-')
+        pred_time = pred['predicted_at'].strftime('%d/%m %H:%M')
+
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
+        story.append(Paragraph(clean(f"No.{i}  Jeu No.{pred['predicted_game']}  ->  {suit_disp}"), h2))
+        story.append(Paragraph(clean(f"Statut : {status_txt}"), norm))
+        story.append(Paragraph(clean(f"Type   : {pred_type}"), norm))
+        story.append(Paragraph(f"Heure  : {pred_time}", norm))
+        story.append(Paragraph("Raison :", norm))
+        for r_line in reason.split('\n'):
+            if r_line.strip():
+                story.append(Paragraph(clean(f"  - {r_line.strip()}"), indent))
+        story.append(Spacer(1, 4*mm))
+
+    doc.build(story)
+    buf.seek(0)
+
+    sender = await get_sender_fn()
+    caption = "\n".join(header_lines)
+    if len(caption) > 1000:
+        caption = caption[:1000] + "..."
+
+    await client.send_file(
+        sender,
+        buf,
+        caption=caption,
+        file_name="predictions_baccarat.pdf",
+        force_document=True
+    )
+
+
 async def cmd_informations(event):
     """Affiche le compteur détaillé de toutes les prédictions avec raisons claires."""
     global compteur2_seuil_B, compteur2_active, prediction_history
@@ -2180,6 +2343,7 @@ async def cmd_informations(event):
             'gagne_r0':  '🏆 Gagné R0',
             'gagne_r1':  '🏆 Gagné R1',
             'gagne_r2':  '🏆 Gagné R2',
+            'gagne_r3':  '🏆 Gagné R3',
             'gagne':     '🏆 Gagné',
             'perdu':     '💔 Perdu',
         }
@@ -2213,7 +2377,7 @@ async def cmd_informations(event):
             lines.append(SEP)
             return lines
 
-        MAX_IN_CHAT = 20
+        MAX_IN_CHAT = 10
 
         if total == 0:
             await event.respond(
@@ -2233,74 +2397,35 @@ async def cmd_informations(event):
 
         if total <= MAX_IN_CHAT:
             body = build_lines(prediction_history)
-            await event.respond("\n".join(header_lines + body))
+            full_text = "\n".join(header_lines + body)
+            # Découper en morceaux si le message dépasse la limite Telegram (4096 chars)
+            MAX_MSG = 4000
+            if len(full_text) <= MAX_MSG:
+                await event.respond(full_text)
+            else:
+                # Envoyer l'en-tête d'abord
+                await event.respond("\n".join(header_lines))
+                # Envoyer les prédictions par blocs
+                chunk_lines = []
+                chunk_size = 0
+                for line in body:
+                    if chunk_size + len(line) + 1 > MAX_MSG and chunk_lines:
+                        await event.respond("\n".join(chunk_lines))
+                        chunk_lines = []
+                        chunk_size = 0
+                    chunk_lines.append(line)
+                    chunk_size += len(line) + 1
+                if chunk_lines:
+                    await event.respond("\n".join(chunk_lines))
         else:
             # Générer un PDF
-            from io import BytesIO
-            from reportlab.lib.pagesizes import A4
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
-            from reportlab.lib.units import mm
-            from reportlab.lib import colors
-
-            buf = BytesIO()
-            doc = SimpleDocTemplate(
-                buf, pagesize=A4,
-                rightMargin=15*mm, leftMargin=15*mm,
-                topMargin=15*mm, bottomMargin=15*mm
-            )
-
-            styles = getSampleStyleSheet()
-            h1 = ParagraphStyle('H1', parent=styles['Heading1'], fontSize=13, spaceAfter=4)
-            h2 = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=10, spaceAfter=3)
-            norm = ParagraphStyle('Norm', parent=styles['Normal'], fontSize=9, spaceAfter=2)
-            indent = ParagraphStyle('Ind', parent=styles['Normal'], fontSize=9, spaceAfter=2, leftIndent=12)
-
-            def clean(s):
-                for old, new in [('♠️','Pique'),('❤️','Coeur'),('♦️','Carreau'),('♣️','Trefle'),
-                                  ('♠','Pique'),('♥','Coeur'),('♦','Carreau'),('♣','Trefle'),
-                                  ('🏆','[W]'),('💔','[L]'),('🎰','[?]'),('🔄',''),('🔁',''),
-                                  ('📊',''),('🎯',''),('▸','>')]:
-                    s = s.replace(old, new)
-                return s.strip()
-
-            story = []
-            story.append(Paragraph(clean(f"Baccarat AI — Predictions ({total} total)"), h1))
-            story.append(Paragraph(clean(f"Statut : {status_str} | B={B}"), norm))
-            story.append(Paragraph("Inverses : Pique<->Carreau  Coeur<->Trefle", norm))
-            story.append(Paragraph(clean(f"Total {total} | Gagne {nb_gagne} | Perdu {nb_perdu} | En cours {nb_cours}"), norm))
-            story.append(Spacer(1, 5*mm))
-
-            for i, pred in enumerate(prediction_history, 1):
-                suit_disp = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
-                status_txt = STATUS_ICONS.get(pred['status'], '?')
-                pred_type = TYPE_LABELS.get(pred['type'], pred['type'])
-                reason = pred.get('reason_text', '—')
-                pred_time = pred['predicted_at'].strftime('%d/%m %H:%M')
-
-                story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
-                story.append(Paragraph(
-                    clean(f"#{i}  Jeu #{pred['predicted_game']}  ->  {suit_disp}"),
-                    h2
-                ))
-                story.append(Paragraph(clean(f"Statut : {status_txt}"), norm))
-                story.append(Paragraph(clean(f"Type   : {pred_type}"), norm))
-                story.append(Paragraph(f"Heure  : {pred_time}", norm))
-                story.append(Paragraph("Raison :", norm))
-                for r_line in reason.split('\n'):
-                    if r_line.strip():
-                        story.append(Paragraph(clean(f"  • {r_line.strip()}"), indent))
-                story.append(Spacer(1, 4*mm))
-
-            doc.build(story)
-            buf.seek(0)
-
-            await client.send_file(
-                await event.get_input_sender(),
-                buf,
-                attributes=[],
-                caption="\n".join(header_lines),
-                file_name="predictions_baccarat.pdf"
+            await _generate_and_send_pdf(
+                event.get_input_sender,
+                prediction_history,
+                header_lines,
+                total, nb_gagne, nb_perdu, nb_cours,
+                status_str, B,
+                STATUS_ICONS, TYPE_LABELS
             )
 
     except Exception as e:
@@ -2324,9 +2449,19 @@ async def cmd_help(event):
 `/compteur1` - Voir Compteur1 (présences)
 `/stats` - Historique séries ≥3 (Compteur1)
 `/compteur3 [B2/on/off/reset]` - Gérer Compteur3 (2ème groupe)
-`/setz [1-20]` - Offset Z : C3 seul → inverse(C3) au numéro source+Z (actuel: {COMPTEUR3_Z})
-`/sete [1-20]` - Offset E : C2 seul ou C2+C3 → numéro source+E (actuel: {COMPTEUR3_E})
 `/synchro` - Voir synchro C2+C3 inverses (♣↔❤️ / ♦↔♠️)
+
+**🎯 Mode de prédiction (actuel: {prediction_mode}):**
+`/modepredict` - Voir le mode actuel
+`/modepredict all` - Toutes les règles simultanément (défaut)
+`/modepredict c2only` - C2 ≥ B → inverse(C2) lancé à source, numéro source+E
+`/modepredict c3only` - C3 ≥ B → inverse(C3) lancé à source, numéro source+Z
+`/modepredict c2c3inverse` - C2+C3 inverses → costume C2 lancé à source, numéro source+F
+
+**⚡ Offsets de prédiction:**
+`/sete [1-20]` - E : numéro cible mode c2only (actuel: {COMPTEUR3_E})
+`/setz [1-20]` - Z : numéro cible mode c3only (actuel: {COMPTEUR3_Z})
+`/setf [1-20]` - F : numéro cible mode c2c3inverse (actuel: {COMPTEUR3_F})
 
 **📡 Canaux:**
 `/canalcompteur2 [ID/off]`
@@ -2345,9 +2480,11 @@ async def cmd_help(event):
 `/history` - Historique
 `/reset` - Reset manuel
 
-ℹ️ **Logique Compteur3:**
-Manques groupe 2. Quand C2=♣️ et C3=❤️ (inverses ♣↔❤️/♦↔♠️)
-→ Prédit C3 au numéro **dernier+Z**
+ℹ️ **Logique des prédictions:**
+• C2 seul ≥ B → inverse(C2) au numéro source+E
+• C3 seul ≥ B → inverse(C3) au numéro source+Z
+• C2+C3 inverses → costume C2 au numéro source+F
+→ La prédiction est lancée **immédiatement** au jeu de détection
 
 🤖 Baccarat AI | By Sossou Kouamé"""
 
@@ -2533,7 +2670,7 @@ async def cmd_setz(event):
 
 
 async def cmd_sete(event):
-    """Configure la valeur E (offset numéro pour C2 seul ou C2+C3)."""
+    """Configure la valeur E (offset numéro pour mode c2only)."""
     global COMPTEUR3_E
 
     if event.is_group or event.is_channel:
@@ -2547,11 +2684,11 @@ async def cmd_sete(event):
 
         if len(parts) == 1:
             await event.respond(
-                f"⚡ **VALEUR E — OFFSET C2**\n\n"
+                f"⚡ **VALEUR E — OFFSET C2 (mode c2only)**\n\n"
                 f"Valeur actuelle: **E = {COMPTEUR3_E}**\n\n"
-                f"Utilisé quand :\n"
-                f"  • C2 seul atteint B → prédit inverse(C2) au numéro source + E\n"
-                f"  • C2 + C3 inverses  → prédit costume C2 au numéro source + E\n\n"
+                f"Utilisé en mode `c2only` ou `all` :\n"
+                f"  • C2 atteint B → prédit inverse(C2) — numéro de prédiction = source + E\n"
+                f"  • La prédiction est lancée immédiatement au jeu de détection\n\n"
                 f"**Usage:** `/sete [1-20]`"
             )
             return
@@ -2563,13 +2700,54 @@ async def cmd_sete(event):
                 return
             old_e = COMPTEUR3_E
             COMPTEUR3_E = e_val
-            await event.respond(f"✅ **E modifié: {old_e} → {e_val}**\n\nPrédiction C2 = numéro source + {e_val}")
+            await event.respond(f"✅ **E modifié: {old_e} → {e_val}**\n\nMode c2only : numéro prédit = source + {e_val}")
             logger.info(f"Admin change COMPTEUR3_E: {old_e} → {e_val}")
         except ValueError:
             await event.respond("❌ Usage: `/sete [1-20]`")
 
     except Exception as e:
         logger.error(f"Erreur cmd_sete: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+async def cmd_setf(event):
+    """Configure la valeur F (offset numéro pour mode c2c3inverse)."""
+    global COMPTEUR3_F
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        parts = event.message.message.split()
+
+        if len(parts) == 1:
+            await event.respond(
+                f"⚡ **VALEUR F — OFFSET C2+C3 INVERSES (mode c2c3inverse)**\n\n"
+                f"Valeur actuelle: **F = {COMPTEUR3_F}**\n\n"
+                f"Utilisé en mode `c2c3inverse` ou `all` :\n"
+                f"  • C2 atteint B ET C3 est l'inverse de C2 → prédit costume C2 — numéro = source + F\n"
+                f"  • La prédiction est lancée immédiatement au jeu de détection\n\n"
+                f"**Usage:** `/setf [1-20]`"
+            )
+            return
+
+        try:
+            f_val = int(parts[1])
+            if not 1 <= f_val <= 20:
+                await event.respond("❌ F doit être entre 1 et 20")
+                return
+            old_f = COMPTEUR3_F
+            COMPTEUR3_F = f_val
+            await event.respond(f"✅ **F modifié: {old_f} → {f_val}**\n\nMode c2c3inverse : numéro prédit = source + {f_val}")
+            logger.info(f"Admin change COMPTEUR3_F: {old_f} → {f_val}")
+        except ValueError:
+            await event.respond("❌ Usage: `/setf [1-20]`")
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_setf: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
 
@@ -2642,6 +2820,66 @@ async def cmd_synchro(event):
         await event.respond(f"❌ Erreur: {e}")
 
 
+async def cmd_modepredict(event):
+    """Configure le mode de prédiction : all, c2only, c3only, c2c3inverse."""
+    global prediction_mode
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        parts = event.message.message.split()
+        MODE_LABELS = {
+            'all':         f'🔀 Toutes les règles (C2→inverse(C2) à +E, C3→inverse(C3) à +Z, C2+C3inv→C2 à +F)',
+            'c2only':      f'📊 C2 seul → prédit inverse(C2) au numéro source + E ({COMPTEUR3_E})',
+            'c3only':      f'🔁 C3 seul → prédit inverse(C3) au numéro source + Z ({COMPTEUR3_Z})',
+            'c2c3inverse': f'🔄 C2 et C3 inverses → prédit costume C2 au numéro source + F ({COMPTEUR3_F})',
+        }
+
+        if len(parts) == 1:
+            current_label = MODE_LABELS.get(prediction_mode, prediction_mode)
+            lines = [
+                "⚙️ **MODE DE PRÉDICTION**",
+                "",
+                f"Mode actuel : **{prediction_mode}**",
+                f"→ {current_label}",
+                "",
+                "Modes disponibles :",
+                "  `/modepredict all`         — Toutes les règles simultanément (défaut)",
+                f"  `/modepredict c2only`      — C2 ≥ B → inverse(C2) à source+E ({COMPTEUR3_E})",
+                f"  `/modepredict c3only`      — C3 ≥ B → inverse(C3) à source+Z ({COMPTEUR3_Z})",
+                f"  `/modepredict c2c3inverse` — C2+C3 inverses → costume C2 à source+F ({COMPTEUR3_F})",
+            ]
+            await event.respond("\n".join(lines))
+            return
+
+        new_mode = parts[1].lower()
+        if new_mode not in MODE_LABELS:
+            await event.respond(
+                f"❌ Mode inconnu : `{new_mode}`\n\n"
+                f"Modes valides : `all`, `c2only`, `c3only`, `c2c3inverse`"
+            )
+            return
+
+        old_mode = prediction_mode
+        prediction_mode = new_mode
+        label = MODE_LABELS[new_mode]
+        await event.respond(
+            f"✅ **Mode de prédiction modifié**\n\n"
+            f"Ancien : `{old_mode}`\n"
+            f"Nouveau : `{new_mode}`\n"
+            f"→ {label}"
+        )
+        logger.info(f"⚙️ Mode de prédiction changé : {old_mode} → {new_mode}")
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_modepredict: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
 async def cmd_reset(event):
     if event.is_group or event.is_channel:
         return
@@ -2676,8 +2914,12 @@ def setup_handlers():
     client.add_event_handler(cmd_compteur3, events.NewMessage(pattern=r'^/compteur3'))
     client.add_event_handler(cmd_setz, events.NewMessage(pattern=r'^/setz'))
     client.add_event_handler(cmd_sete, events.NewMessage(pattern=r'^/sete'))
+    client.add_event_handler(cmd_setf, events.NewMessage(pattern=r'^/setf'))
     client.add_event_handler(cmd_synchro, events.NewMessage(pattern=r'^/synchro$'))
     client.add_event_handler(cmd_informations, events.NewMessage(pattern=r'^/informations$'))
+
+    # Mode de prédiction
+    client.add_event_handler(cmd_modepredict, events.NewMessage(pattern=r'^/modepredict'))
 
     # Gestion
     client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
