@@ -3,7 +3,6 @@ import asyncio
 import re
 import logging
 import sys
-import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta
@@ -45,7 +44,6 @@ last_source_game_number = 0
 last_prediction_time: Optional[datetime] = None
 prediction_channel_ok = False
 client = None
-suit_block_until: Dict[str, datetime] = {}
 waiting_finalization: Dict[int, dict] = {}
 
 # Compteur2 - Gestion des costumes manquants (interne uniquement)
@@ -83,77 +81,16 @@ prediction_queue: List[Dict] = []  # File ordonnée des prédictions en attente
 PREDICTION_SEND_AHEAD = 2  # Envoyer la prédiction quand canal source est à N-2
 
 # Canaux secondaires pour redirection
-COMPTEUR2_CHANNEL_ID = None     # Canal spécifique pour Compteur2
+COMPTEUR2_CHANNEL_ID = None     # Canal spécifique pour Compteur2 (legacy)
 
-# ============================================================================
-# SYSTÈME DE PAUSE PAR CYCLE (CORRIGÉ)
-# ============================================================================
+# Canaux de redirection par mode de prédiction
+CANAL_C2_ID = None      # Canal dédié prédictions C2 seul
+CANAL_C3_ID = None      # Canal dédié prédictions C3 seul
+CANAL_C2C3_ID = None    # Canal dédié prédictions C2+C3 inverses
 
-# État de la pause
-pause_active = False
-pause_counter = 0  # Compteur de prédictions (1-4)
-pause_cycle_index = 0  # Index dans le cycle (0, 1, 2...)
-pause_message_id = None  # ID du message de pause à éditer
-pause_end_time = None  # Heure de fin de pause
-pause_task = None  # Tâche de mise à jour du message
-
-# Configuration pause
-PAUSE_CYCLE = [3, 5, 4]  # Durées en minutes par défaut
-PREDICTIONS_BEFORE_PAUSE = 4  # Nombre de prédictions avant pause
-
-# Expressions de reprise (44 expressions : confiance, proverbes, joie, blague, confort, soulagement)
-RESUME_EXPRESSIONS = [
-    # ── Joie & Célébration ──────────────────────────────────────────────────
-    "🎉 Bingo ! Les prédictions reprennent ! Bot créé par Sossou Kouamé",
-    "🚀 C'est reparti mon kiki ! Sossou Kouamé vous présente la suite",
-    "🎰 La pause est finie, le jeu continue ! By Sossou Kouamé",
-    "🎊 Hourra ! La fête continue ! Sossou Kouamé vous accueille",
-    "🥳 On est partis ! Les prédictions sont de retour - Sossou Kouamé",
-    "🎆 Feux d'artifice de prédictions ! Sossou Kouamé fait la fête",
-    "🎈 Ballons lâchés, prédictions lancées ! By Sossou Kouamé",
-    "💃 La danse des prédictions recommence ! Sossou Kouamé vous invite",
-    "🎵 Tadam ! Les prédictions sont de retour - Sossou Kouamé",
-    "🌈 Arc-en-ciel de victoires en vue ! Bot by Sossou Kouamé",
-    # ── Confiance & Force ───────────────────────────────────────────────────
-    "🔥 De retour en action ! Bot by Sossou Kouamé",
-    "⚡ Énergie rechargée à 100% ! Sossou Kouamé au rapport",
-    "💪 Fort comme un lion, précis comme une flèche ! Sossou Kouamé revient",
-    "🦁 Le roi de la prédiction est de retour ! Sossou Kouamé aux commandes",
-    "🎯 Viser juste, toujours viser juste ! Sossou Kouamé reprend le jeu",
-    "⚡ Puissance maximale réactivée ! Sossou Kouamé est prêt",
-    "🔥 Inarrêtable ! Les prédictions de Sossou Kouamé reprennent",
-    "🚀 Décollage confirmé ! Sossou Kouamé aux commandes de la fusée",
-    "🎖️ Médaille de la patience décernée ! Reprise Sossou Kouamé",
-    "⚔️ À l'attaque ! Le bot de Sossou Kouamé reprend du service",
-    # ── Blagues & Légèreté ──────────────────────────────────────────────────
-    "😂 J'ai failli m'endormir mais me voilà ! Sossou Kouamé reprend le service",
-    "🤣 Même une pause ne peut pas arrêter Sossou Kouamé — les prédictions reviennent !",
-    "😄 Le chat a fait sa sieste, il revient avec des prédictions en or ! By Sossou Kouamé",
-    "🎭 Fin de l'entracte, le spectacle continue ! By Sossou Kouamé",
-    "🎩 Abracadabra ! Les prédictions réapparaissent - By Sossou Kouamé",
-    "🃏 La carte gagnante est tirée ! Sossou Kouamé reprend les prédictions",
-    # ── Confort & Soulagement ───────────────────────────────────────────────
-    "😌 Respirez, les prédictions reprennent ! Sossou Kouamé veille",
-    "🌸 Tout va bien, Sossou Kouamé est là pour les prédictions !",
-    "🕊️ La paix retrouvée, les prédictions reprennent ! By Sossou Kouamé",
-    "🌊 Après la vague, le calme et la victoire ! Prédictions reprises - Sossou Kouamé",
-    "🛡️ Protégés par l'IA de Sossou Kouamé, les prédictions reprennent !",
-    "🌻 Comme un tournesol vers le soleil, les prédictions repartent ! Sossou Kouamé",
-    "🌙 Même la lune se repose avant de briller ! Sossou Kouamé reprend",
-    "🌟 Le spectacle continue ! Bot Telegram de Sossou Kouamé",
-    "🔮 La boule de cristal est de nouveau claire ! Sossou Kouamé",
-    # ── Proverbes touchants ─────────────────────────────────────────────────
-    "🌦️ Après la pluie, le beau temps ! Les prédictions sont de retour - Sossou Kouamé",
-    "💎 Le diamant ne brille qu'après avoir été taillé — comme nos prédictions ! Sossou Kouamé",
-    "🌅 La nuit la plus sombre précède toujours l'aube la plus belle ! Sossou Kouamé aux commandes",
-    "🌱 Qui sème avec patience récolte avec abondance ! Prédictions reprises - Sossou Kouamé",
-    "🏔️ Ce qui ne te tue pas te rend plus fort ! Sossou Kouamé plus fort que jamais",
-    "🎓 La patience est la mère de toutes les vertus — les prédictions reprennent ! Sossou Kouamé",
-    "🤝 Si tu veux aller loin, marchons ensemble vers la victoire ! Sossou Kouamé",
-    "🌍 Dieu ne dort jamais, et Sossou Kouamé non plus — prédictions en cours !",
-    "💫 Et c'est reparti pour un tour ! Sossou Kouamé vous souhaite bonne chance",
-    "🍀 La chance sourit aux audacieux — et aux patients ! Reprise par Sossou Kouamé",
-]
+# Suivi des costumes par numéro de jeu (pour commande /ecarts)
+game_suit_log: Dict[int, List[str]] = {}   # {game_number: [suits présents groupe1]}
+game_suit_log3: Dict[int, List[str]] = {}  # {game_number: [suits présents groupe2/Banquier]}
 
 # ============================================================================
 # FONCTION UTILITAIRE - Conversion ID Canal
@@ -402,7 +339,7 @@ def update_compteur3(game_number: int, second_group: str):
 # ============================================================================
 
 def add_to_history(game_number: int, message_text: str, first_group: str, suits_found: List[str]):
-    global finalized_messages_history
+    global finalized_messages_history, game_suit_log
     
     entry = {
         'timestamp': datetime.now(),
@@ -417,6 +354,10 @@ def add_to_history(game_number: int, message_text: str, first_group: str, suits_
     
     if len(finalized_messages_history) > MAX_HISTORY_SIZE:
         finalized_messages_history = finalized_messages_history[:MAX_HISTORY_SIZE]
+
+    # Enregistrer dans le journal par numéro pour les écarts
+    if 1 <= game_number <= 1440:
+        game_suit_log[game_number] = list(suits_found)
 
 def add_prediction_to_history(game_number: int, suit: str, verification_games: List[int], prediction_type: str = 'standard', reason_text: str = ''):
     global prediction_history
@@ -465,6 +406,220 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
             break
 
 # ============================================================================
+# ÉCARTS — CALCUL ET RAPPORT
+# ============================================================================
+
+SUIT_NAMES_ECART = {
+    '♠': '♠️ Pique',
+    '♥': '❤️ Cœur',
+    '♦': '♦️ Carreau',
+    '♣': '♣️ Trèfle',
+}
+
+def compute_ecarts(max_game: int = 1440, suit_log: Dict = None) -> Dict[str, List[Dict]]:
+    """
+    Calcule les écarts (absences consécutives) pour chaque costume
+    sur les jeux 1 à max_game.
+
+    Retourne un dict {suit: [{'start': A, 'end': B, 'ecart': N}, ...]}
+    où A = dernier jeu où le costume a été vu avant l'absence,
+        B = premier jeu où il réapparaît après l'absence,
+        ecart = B - A - 1  (nombre de jeux consécutifs absents).
+    Un écart de 1 signifie que le costume manquait sur exactement 1 jeu.
+    """
+    if suit_log is None:
+        suit_log = game_suit_log
+    result: Dict[str, List[Dict]] = {s: [] for s in ALL_SUITS}
+
+    for suit in ALL_SUITS:
+        last_seen = 0      # dernier jeu où le costume a été vu (0 = jamais encore)
+        absent_start = None
+
+        for g in range(1, max_game + 1):
+            suits_here = suit_log.get(g)
+            if suits_here is None:
+                # Jeu non enregistré → ignorer (données manquantes)
+                continue
+
+            if suit in suits_here:
+                # Costume présent
+                if absent_start is not None:
+                    # Fin d'une période d'absence
+                    ecart_val = g - last_seen - 1
+                    if ecart_val >= 1:
+                        result[suit].append({
+                            'start': last_seen,
+                            'end': g,
+                            'ecart': ecart_val,
+                        })
+                    absent_start = None
+                last_seen = g
+            else:
+                # Costume absent
+                if absent_start is None:
+                    absent_start = g
+
+        # Si absence encore en cours à la fin
+        if absent_start is not None and last_seen < max_game:
+            ecart_val = max_game - last_seen
+            if ecart_val >= 1:
+                result[suit].append({
+                    'start': last_seen,
+                    'end': max_game,
+                    'ecart': ecart_val,
+                })
+
+    return result
+
+
+def get_max_ecart(ecarts_by_suit: Dict[str, List[Dict]]) -> Dict[str, Optional[Dict]]:
+    """Retourne l'écart maximum pour chaque costume."""
+    max_ecarts = {}
+    for suit in ALL_SUITS:
+        entries = ecarts_by_suit.get(suit, [])
+        if not entries:
+            max_ecarts[suit] = None
+        else:
+            max_ecarts[suit] = max(entries, key=lambda x: x['ecart'])
+    return max_ecarts
+
+
+def build_ecarts_text(ecarts_by_suit: Dict[str, List[Dict]], max_game: int = 1440, title: str = "Joueurs.....") -> str:
+    """Construit le texte formaté des écarts pour affichage Telegram."""
+    lines = [f"📊 **ÉCARTS DES COSTUMES — {title}** (Jeux #1 → #{max_game})", ""]
+
+    for suit in ['♦', '♠', '♥', '♣']:
+        name = SUIT_NAMES_ECART.get(suit, suit)
+        entries = ecarts_by_suit.get(suit, [])
+        lines.append(f"**Pour {name}**")
+        if not entries:
+            lines.append("  Aucun écart détecté")
+        else:
+            for e in entries:
+                lines.append(f"  {e['start']}_{e['end']}  écart : {e['ecart']}")
+        lines.append("")
+
+    # Bilan écart max
+    lines.append("━" * 30)
+    lines.append("**Bilan écart max**")
+    max_ecarts = get_max_ecart(ecarts_by_suit)
+    now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
+    for suit in ['♦', '♠', '♥', '♣']:
+        name = SUIT_NAMES_ECART.get(suit, suit)
+        m = max_ecarts.get(suit)
+        if m:
+            lines.append(f"  {name} : max {m['ecart']}  [{m['start']}_{m['end']}]  ({now_str})")
+        else:
+            lines.append(f"  {name} : aucun écart")
+
+    return "\n".join(lines)
+
+
+async def generate_and_send_ecarts_pdf(recipient, ecarts_by_suit: Dict[str, List[Dict]], max_game: int = 1440, title: str = "Joueurs....."):
+    """Génère un PDF des écarts et l'envoie."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=15*mm, leftMargin=15*mm,
+        topMargin=15*mm, bottomMargin=15*mm
+    )
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('H1', parent=styles['Heading1'], fontSize=13, spaceAfter=4)
+    h2 = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=10, spaceAfter=3)
+    norm = ParagraphStyle('Norm', parent=styles['Normal'], fontSize=9, spaceAfter=2)
+    bold = ParagraphStyle('Bold', parent=styles['Normal'], fontSize=9, spaceAfter=2, fontName='Helvetica-Bold')
+
+    suit_names_pdf = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+    now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
+
+    story = []
+    story.append(Paragraph(f"Baccarat AI - Ecarts des Costumes - {title} (Jeux 1 a {max_game})", h1))
+    story.append(Paragraph(f"Genere le {now_str}", norm))
+    story.append(Spacer(1, 5*mm))
+
+    max_ecarts = get_max_ecart(ecarts_by_suit)
+
+    for suit in ['♦', '♠', '♥', '♣']:
+        name = suit_names_pdf.get(suit, suit)
+        entries = ecarts_by_suit.get(suit, [])
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
+        story.append(Paragraph(f"Pour {name}", h2))
+        if not entries:
+            story.append(Paragraph("Aucun ecart detecte", norm))
+        else:
+            for e in entries:
+                story.append(Paragraph(
+                    f"  {e['start']}_{e['end']}  ecart : {e['ecart']}",
+                    norm
+                ))
+        story.append(Spacer(1, 3*mm))
+
+    story.append(HRFlowable(width="100%", thickness=2, color=colors.black))
+    story.append(Paragraph("Bilan ecart max", bold))
+    story.append(Spacer(1, 2*mm))
+    for suit in ['♦', '♠', '♥', '♣']:
+        name = suit_names_pdf.get(suit, suit)
+        m = max_ecarts.get(suit)
+        if m:
+            story.append(Paragraph(
+                f"  {name} : max {m['ecart']}  [{m['start']}_{m['end']}]  ({now_str})",
+                norm
+            ))
+        else:
+            story.append(Paragraph(f"  {name} : aucun ecart", norm))
+
+    doc.build(story)
+    buf.seek(0)
+
+    total_ecarts = sum(len(v) for v in ecarts_by_suit.values())
+    caption = (
+        f"📊 Écarts des Costumes — {title} — Jeux #1 à #{max_game}\n"
+        f"Total des périodes d'écart : {total_ecarts}\n"
+        f"Généré le {now_str}"
+    )
+    file_tag = "banquier" if "Banquier" in title else "joueurs"
+    await client.send_file(
+        recipient,
+        buf,
+        caption=caption,
+        file_name=f"ecarts_costumes_{file_tag}_{max_game}.pdf",
+        force_document=True
+    )
+
+
+async def _send_ecarts_auto(game_number: int):
+    """Envoie les rapports d'écarts (Joueurs + Banquier) automatiquement."""
+    try:
+        max_g = game_number
+        ecarts1 = compute_ecarts(max_g, suit_log=game_suit_log)
+        ecarts3 = compute_ecarts(max_g, suit_log=game_suit_log3)
+        logger.info(f"📊 Rapports écarts auto générés pour #{max_g}")
+
+        if ADMIN_ID and ADMIN_ID != 0:
+            admin_entity = await client.get_input_entity(ADMIN_ID)
+            await generate_and_send_ecarts_pdf(admin_entity, ecarts1, max_g, title="Joueurs.....")
+            await generate_and_send_ecarts_pdf(admin_entity, ecarts3, max_g, title="Banquier")
+            logger.info(f"✅ PDFs écarts envoyés à l'admin")
+
+        if PREDICTION_CHANNEL_ID:
+            pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+            if pred_entity:
+                await generate_and_send_ecarts_pdf(pred_entity, ecarts1, max_g, title="Joueurs.....")
+                await generate_and_send_ecarts_pdf(pred_entity, ecarts3, max_g, title="Banquier")
+                logger.info(f"✅ PDFs écarts envoyés au canal prédictions")
+    except Exception as e:
+        logger.error(f"❌ Erreur envoi écarts auto: {e}")
+
+
+# ============================================================================
 # INITIALISATION
 # ============================================================================
 
@@ -502,182 +657,6 @@ def get_suits_in_group(group_str: str) -> List[str]:
         normalized = normalized.replace(old, new)
     
     return [suit for suit in ALL_SUITS if suit in normalized]
-
-def block_suit(suit: str, minutes: int = 5):
-    suit_block_until[suit] = datetime.now() + timedelta(minutes=minutes)
-    logger.info(f"🔒 {suit} bloqué {minutes}min")
-
-# ============================================================================
-# SYSTÈME DE PAUSE - GESTION (CORRIGÉ)
-# ============================================================================
-
-def format_pause_message(duration_min: int, remaining_seconds: int) -> str:
-    """Formate le message de pause avec temps dynamique."""
-    if remaining_seconds <= 0:
-        return f"""⏸️ PAUSE TERMINÉE
-
-✅ Fin de la pause
-🔄 Préparation de la reprise...
-
-🤖 Baccarat AI"""
-    
-    minutes = remaining_seconds // 60
-    seconds = remaining_seconds % 60
-    
-    return f"""⏸️ PAUSE ACTIVE
-
-🕐 Durée: {duration_min} minutes
-⏳ Temps restant: {minutes}:{seconds:02d}
-
-🤖 Baccarat AI"""
-
-def format_resume_message() -> str:
-    """Choisit une expression aléatoire de reprise."""
-    return random.choice(RESUME_EXPRESSIONS)
-
-async def update_pause_message(duration_min: int, remaining_seconds: int):
-    """Met à jour le message de pause en temps réel."""
-    global pause_message_id, pause_active, pause_end_time
-    
-    if not pause_active or not pause_message_id:
-        return
-    
-    try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if not prediction_entity:
-            return
-        
-        display_seconds = max(0, remaining_seconds)
-        msg = format_pause_message(duration_min, display_seconds)
-        
-        await client.edit_message(prediction_entity, pause_message_id, msg, parse_mode='markdown')
-        
-    except Exception as e:
-        logger.error(f"❌ Erreur mise à jour pause: {e}")
-
-async def pause_countdown_task(duration_min: int):
-    """Tâche qui met à jour le message de pause chaque seconde."""
-    global pause_active, pause_message_id, pause_end_time
-    
-    total_seconds = duration_min * 60
-    
-    for i in range(total_seconds, 0, -1):
-        if not pause_active:
-            logger.info("⏸️ Pause annulée manuellement")
-            return
-        
-        await update_pause_message(duration_min, i)
-        await asyncio.sleep(1)
-    
-    if pause_active:
-        logger.info("⏸️ Temps écoulé, fin de pause automatique")
-        await end_pause()
-
-async def start_pause():
-    """Démarre une pause (appelé manuellement via /pause on ou par fin de cycle)."""
-    global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
-    
-    if pause_active:
-        logger.warning("⏸️ Pause déjà active")
-        return
-    
-    if pending_predictions:
-        logger.warning(f"⏸️ start_pause: {len(pending_predictions)} prédiction(s) encore active(s), pause reportée")
-        return
-    
-    duration = PAUSE_CYCLE[pause_cycle_index % len(PAUSE_CYCLE)]
-    
-    pause_active = True
-    pause_end_time = datetime.now() + timedelta(minutes=duration)
-    
-    try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if prediction_entity:
-            msg = format_pause_message(duration, duration * 60)
-            sent = await client.send_message(prediction_entity, msg, parse_mode='markdown')
-            pause_message_id = sent.id
-            
-            pause_task = asyncio.create_task(pause_countdown_task(duration))
-            
-            logger.info(f"⏸️ PAUSE DÉMARRÉE: {duration} min (cycle index: {pause_cycle_index})")
-    except Exception as e:
-        logger.error(f"❌ Erreur démarrage pause: {e}")
-        pause_active = False
-
-async def end_pause():
-    """Termine la pause et envoie message de reprise."""
-    global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
-    
-    if not pause_active:
-        return
-    
-    pause_active = False
-    pause_counter = 0
-    pause_cycle_index += 1
-    pause_end_time = None
-    
-    if pause_task and not pause_task.done():
-        pause_task.cancel()
-        try:
-            await pause_task
-        except asyncio.CancelledError:
-            pass
-    
-    try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if prediction_entity and pause_message_id:
-            resume_msg = format_resume_message()
-            
-            await client.edit_message(
-                prediction_entity, 
-                pause_message_id, 
-                f"✅ **PAUSE TERMINÉE**\n\n{resume_msg}", 
-                parse_mode='markdown'
-            )
-            
-            logger.info(f"▶️ PAUSE TERMINÉE - Reprise avec: {resume_msg[:50]}...")
-            
-            pause_message_id = None
-            
-            if prediction_queue:
-                logger.info(f"📤 {len(prediction_queue)} prédictions en attente, traitement...")
-                await process_prediction_queue(current_game_number)
-                
-    except Exception as e:
-        logger.error(f"❌ Erreur fin pause: {e}")
-
-def increment_pause_counter():
-    """Incrémente le compteur de pause et vérifie si pause nécessaire."""
-    global pause_counter, pause_active
-    
-    if pause_active:
-        return False
-    
-    pause_counter += 1
-    logger.info(f"⏸️ Compteur pause: {pause_counter}/{PREDICTIONS_BEFORE_PAUSE}")
-    
-    if pause_counter >= PREDICTIONS_BEFORE_PAUSE:
-        logger.info("⏸️ Seuil atteint, pause programmée après vérification")
-        return True
-    
-    return False
-
-async def check_and_trigger_pause(game_number: int):
-    """Vérifie si une prédiction terminée doit déclencher la pause.
-    La pause ne démarre que lorsque toutes les prédictions en cours sont vérifiées."""
-    global pause_counter, pause_active
-    
-    if pause_active:
-        return
-    
-    if pause_counter >= PREDICTIONS_BEFORE_PAUSE:
-        # Attendre que TOUTES les prédictions en cours soient terminées
-        if pending_predictions:
-            remaining = list(pending_predictions.keys())
-            logger.info(f"⏸️ Pause en attente — prédictions encore actives: {remaining}")
-            return
-        
-        await start_pause()
 
 # ============================================================================
 # GESTION DES PRÉDICTIONS - MESSAGES SIMPLIFIÉS
@@ -734,10 +713,6 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
 async def send_prediction_to_channel(channel_id: int, game_number: int, suit: str, 
                                     prediction_type: str, is_secondary: bool = False) -> Optional[int]:
     try:
-        if not is_secondary and suit in suit_block_until and datetime.now() < suit_block_until[suit]:
-            logger.info(f"🔒 {suit} bloqué, prédiction annulée")
-            return None
-        
         if not channel_id:
             return None
         
@@ -765,6 +740,7 @@ async def send_prediction_to_channel(channel_id: int, game_number: int, suit: st
 async def send_prediction_multi_channel(game_number: int, suit: str, prediction_type: str = 'standard', reason_text: str = '') -> bool:
     """Envoie la prédiction au canal principal ET aux canaux secondaires selon le type."""
     global last_prediction_time, last_prediction_number_sent, COMPTEUR2_CHANNEL_ID
+    global CANAL_C2_ID, CANAL_C3_ID, CANAL_C2C3_ID
     
     success = False
     
@@ -806,36 +782,41 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             success = True
             
             # Envoyer aux canaux secondaires SEULEMENT si le canal principal a réussi
-            # et stocker le message ID pour pouvoir mettre à jour le résultat plus tard
-            secondary_channel_id = None
+            # Collecter tous les canaux secondaires applicables
+            secondary_channels = []
             if prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
-                secondary_channel_id = COMPTEUR2_CHANNEL_ID
-            
-            if secondary_channel_id:
+                secondary_channels.append(COMPTEUR2_CHANNEL_ID)
+            if prediction_type == 'compteur2' and CANAL_C2_ID:
+                secondary_channels.append(CANAL_C2_ID)
+            if prediction_type == 'compteur3_seul' and CANAL_C3_ID:
+                secondary_channels.append(CANAL_C3_ID)
+            if prediction_type == 'compteur2_c3' and CANAL_C2C3_ID:
+                secondary_channels.append(CANAL_C2C3_ID)
+
+            # Dédupliquer
+            seen_cids = set()
+            for cid in secondary_channels:
+                if cid in seen_cids:
+                    continue
+                seen_cids.add(cid)
                 sec_msg_id = await send_prediction_to_channel(
-                    secondary_channel_id, game_number, suit, prediction_type, is_secondary=True
+                    cid, game_number, suit, prediction_type, is_secondary=True
                 )
                 if sec_msg_id:
-                    pending_predictions[game_number]['secondary_message_id'] = sec_msg_id
-                    pending_predictions[game_number]['secondary_channel_id'] = secondary_channel_id
-                    logger.info(f"📡 Canal secondaire {secondary_channel_id}: #{game_number} envoyé (msg {sec_msg_id})")
+                    pending_predictions[game_number].setdefault('secondary_message_id', sec_msg_id)
+                    pending_predictions[game_number].setdefault('secondary_channel_id', cid)
+                    logger.info(f"📡 Canal redirect {cid}: #{game_number} envoyé (msg {sec_msg_id})")
         else:
             # Envoi échoué — retirer le placeholder pour ne pas bloquer le système
             if game_number in pending_predictions and pending_predictions[game_number]['status'] == 'sending':
                 del pending_predictions[game_number]
             last_prediction_number_sent = old_last  # restaurer l'ancien last
     
-    if success and not pause_active:
-        need_pause = increment_pause_counter()
-        if need_pause:
-            logger.info(f"⏸️ La {PREDICTIONS_BEFORE_PAUSE}ème prédiction (#{game_number}) va déclencher la pause après vérification")
     
     return success
 
 async def update_prediction_message(game_number: int, status: str, rattrapage: int = 0):
     """Met à jour le statut d'une prédiction (uniquement canal principal)."""
-    global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
-    
     if game_number not in pending_predictions:
         logger.warning(f"⚠️ update_prediction_message: #{game_number} introuvable (déjà traité?)")
         return
@@ -849,7 +830,6 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
         logger.info(f"✅ Gagné: #{game_number} (R{rattrapage})")
     else:
         logger.info(f"❌ Perdu: #{game_number}")
-        block_suit(suit, 5)
     
     # ── SECTION SYNCHRONE (aucun await) ─────────────────────────────────────
     # Tout ce qui suit se fait AVANT le premier await.
@@ -857,17 +837,6 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
     
     del pending_predictions[game_number]
     
-    # Si les conditions de pause sont atteintes, verrouiller pause_active = True
-    # IMMÉDIATEMENT — avant tout await — pour bloquer les envois concurrents.
-    pause_to_start = False
-    pause_duration = None
-    if not pause_active and pause_counter >= PREDICTIONS_BEFORE_PAUSE and not pending_predictions:
-        pause_to_start = True
-        pause_duration = PAUSE_CYCLE[pause_cycle_index % len(PAUSE_CYCLE)]
-        pause_active = True  # ← VERROU INSTANTANÉ
-        pause_end_time = datetime.now() + timedelta(minutes=pause_duration)
-        logger.info(f"⏸️ Pause verrouillée ({pause_duration} min) — aucun envoi possible")
-    # ── FIN SECTION SYNCHRONE ────────────────────────────────────────────────
     
     # Éditer le message de prédiction — canal principal
     try:
@@ -890,18 +859,6 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
         except Exception as e:
             logger.error(f"❌ Erreur édition canal secondaire #{game_number}: {e}")
     
-    # Finaliser l'envoi du message de pause si nécessaire
-    if pause_to_start:
-        try:
-            prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-            if prediction_entity:
-                pause_msg = format_pause_message(pause_duration, pause_duration * 60)
-                sent = await client.send_message(prediction_entity, pause_msg, parse_mode='markdown')
-                pause_message_id = sent.id
-                pause_task = asyncio.create_task(pause_countdown_task(pause_duration))
-                logger.info(f"⏸️ PAUSE DÉMARRÉE: {pause_duration} min (cycle index: {pause_cycle_index})")
-        except Exception as e:
-            logger.error(f"❌ Erreur envoi message pause: {e}")
 
 async def update_prediction_progress(game_number: int, current_check: int):
     """Met à jour l'affichage de la progression (canal principal uniquement)."""
@@ -1034,7 +991,7 @@ def get_all_counter_predictions(current_game: int) -> List[tuple]:
 
     Modes :
       'c2only'      → C2 atteint B → prédit inverse(C2) au numéro (base + E)
-      'c3only'      → C3 atteint B → prédit inverse(C3) au numéro (base + Z)
+      'c3only'      → C3 atteint B → prédit costume manquant(C3) au numéro (base + Z)
       'c2c3inverse' → C2 atteint B ET C3 est inverse de C2 → prédit C2 manquant au numéro (base + F)
       'all'         → toutes les règles ci-dessus simultanément
     """
@@ -1118,7 +1075,7 @@ def get_all_counter_predictions(current_game: int) -> List[tuple]:
             consumed_c2.add(suit_c2)
             ready.append((predicted_suit, pred_number, pred_type, reason, send_at))
 
-    # ── ÉTAPE 3 : C3 SEUL → inverse(C3) à base+Z ───────────────────────────
+    # ── ÉTAPE 3 : C3 SEUL → costume manquant(C3) à base+Z ──────────────────
     if prediction_mode in ('c3only', 'all') and compteur3_active:
         for suit_c3 in ALL_SUITS:
             if suit_c3 in consumed_c3:
@@ -1128,19 +1085,17 @@ def get_all_counter_predictions(current_game: int) -> List[tuple]:
                 continue
 
             c3_display = SUIT_DISPLAY.get(suit_c3, suit_c3)
-            inv_c3 = get_suit_inverse(suit_c3)
-            inv_display = SUIT_DISPLAY.get(inv_c3, inv_c3) if inv_c3 else '?'
             c3_start = tc3.streak_start_game
             c3_interval_end = c3_start + compteur3_seuil_B2 - 1
             pred_number = base + COMPTEUR3_Z
-            predicted_suit = inv_c3 if inv_c3 else suit_c3
+            predicted_suit = suit_c3
             pred_type = 'compteur3_seul'
             reason = (
                 f"C3 manque {c3_display} [#{c3_start}→#{c3_interval_end}] ({compteur3_seuil_B2} absences)\n"
-                f"Z = {COMPTEUR3_Z} → Prédiction #{pred_number} — Inverse de C3 : {inv_display}"
+                f"Z = {COMPTEUR3_Z} → Prédiction #{pred_number} — Costume manquant C3 : {c3_display}"
             )
             logger.info(
-                f"🔁 [C3ONLY] {suit_c3} → inverse {inv_c3} → #{pred_number} [Z={COMPTEUR3_Z}, send_at=#{send_at}]"
+                f"🔁 [C3ONLY] {suit_c3} → manquant {suit_c3} → #{pred_number} [Z={COMPTEUR3_Z}, send_at=#{send_at}]"
             )
             tc3.reset(current_game)
             consumed_c3.add(suit_c3)
@@ -1200,12 +1155,6 @@ def get_synchro_status() -> List[dict]:
 # ============================================================================
 
 def can_accept_prediction(pred_number: int) -> bool:
-    global prediction_queue, pending_predictions, last_prediction_number_sent, MIN_GAP_BETWEEN_PREDICTIONS, pause_active
-    
-    if pause_active:
-        logger.info(f"⛔ En pause, prédiction #{pred_number} rejetée")
-        return False
-    
     if last_prediction_number_sent > 0:
         gap = pred_number - last_prediction_number_sent
         if gap < MIN_GAP_BETWEEN_PREDICTIONS:
@@ -1235,12 +1184,6 @@ def add_to_prediction_queue(game_number: int, suit: str, prediction_type: str, r
               Par défaut = game_number (envoi quand la source atteint le jeu prédit).
               Pour envoi immédiat : passer send_at = base (numéro de détection).
     """
-    global prediction_queue, pause_active
-    
-    if pause_active:
-        logger.info(f"⏸️ En pause, #{game_number} non ajouté")
-        return False
-    
     for pred in prediction_queue:
         if pred['game_number'] == game_number:
             logger.info(f"⚠️ Prédiction #{game_number} déjà dans la file")
@@ -1276,11 +1219,6 @@ async def process_prediction_queue(current_game: int):
       - Expirée  : si current_game > game_number (jeu cible déjà passé)
       - Envoyer  : si current_game >= send_at (moment de lancement atteint) ET pas de pending
     """
-    global prediction_queue, pending_predictions, pause_active
-    
-    if pause_active:
-        return
-    
     # RÈGLE 1: Jamais de nouvelle prédiction si une est encore en cours de vérification
     if pending_predictions:
         logger.info(f"⏳ {len(pending_predictions)} prédiction(s) en cours, file en attente")
@@ -1317,9 +1255,6 @@ async def process_prediction_queue(current_game: int):
         send_at = to_send.get('send_at', pred_number)
         
         # Vérification finale juste avant envoi (protection race condition)
-        if pause_active:
-            logger.warning(f"⚠️ Pause détectée avant envoi #{pred_number}, annulé")
-            return
         if pending_predictions:
             logger.warning(f"⚠️ Prédiction active détectée avant envoi #{pred_number}, annulé")
             return
@@ -1339,35 +1274,35 @@ async def process_prediction_queue(current_game: int):
 # ============================================================================
 
 async def process_game_result(game_number: int, message_text: str):
-    global current_game_number, last_source_game_number, pause_active, pause_end_time
+    global current_game_number, last_source_game_number
     
     current_game_number = game_number
     last_source_game_number = game_number
     
-    # Vérifier si pause expirée
-    if pause_active and pause_end_time:
-        remaining = (pause_end_time - datetime.now()).total_seconds()
-        if remaining <= 0:
-            logger.info("⏸️ Pause expirée détectée, reprise automatique")
-            await end_pause()
-    
-    # Reset auto à #1440
-    if current_game_number >= 1440:
-        logger.warning(f"🚨 RESET #1440 atteint")
-        await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
-        return
     
     groups = extract_parentheses_groups(message_text)
     if not groups:
         logger.warning(f"⚠️ Pas de groupe trouvé dans #{game_number}")
+        # Même sans groupe, on vérifie le reset
+        if current_game_number >= 1440:
+            logger.warning(f"🚨 RESET #1440 atteint (pas de groupe)")
+            await _send_ecarts_auto(game_number)
+            await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
         return
-    
+
     first_group = groups[0]
     suits_in_first = get_suits_in_group(first_group)
-    
+
     logger.info(f"📊 Jeu #{game_number}: {suits_in_first} dans '{first_group[:30]}...'")
-    
+
     add_to_history(game_number, message_text, first_group, suits_in_first)
+
+    # Reset auto à #1440 (après avoir enregistré le jeu 1440 dans game_suit_log)
+    if current_game_number >= 1440:
+        logger.warning(f"🚨 RESET #1440 atteint")
+        await _send_ecarts_auto(game_number)
+        await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
+        return
     
     # NOUVEAU: Mettre à jour Compteur1 (présences consécutives)
     update_compteur1(game_number, first_group)
@@ -1375,30 +1310,31 @@ async def process_game_result(game_number: int, message_text: str):
     # 1. Vérification des prédictions existantes (libère pending si terminé)
     await check_prediction_result(game_number, first_group)
     
-    if not pause_active:
-        # 2. Mise à jour des compteurs
-        if compteur2_active:
-            update_compteur2(game_number, first_group)
+    # 2. Mise à jour des compteurs
+    if compteur2_active:
+        update_compteur2(game_number, first_group)
 
-        if compteur3_active and len(groups) >= 2:
-            second_group = groups[1]
-            update_compteur3(game_number, second_group)
+    if compteur3_active and len(groups) >= 2:
+        second_group = groups[1]
+        update_compteur3(game_number, second_group)
+        # Enregistrer les costumes du 2ème groupe pour /ecarts3
+        suits_in_second = get_suits_in_group(second_group)
+        if 1 <= game_number <= 1440:
+            game_suit_log3[game_number] = list(suits_in_second)
 
-        # 3. Générer et mettre en file les nouvelles prédictions (avec send_at = jeu de détection)
-        if compteur2_active or compteur3_active:
-            all_preds = get_all_counter_predictions(game_number)
-            type_labels_log = {
-                'compteur2':      '📊 C2 seul (inverse)',
-                'compteur2_c3':   '📊+🔄 C2+C3 (costume C2)',
-                'compteur3_seul': '🔁 C3 seul (inverse)',
-            }
-            for predicted_suit, pred_num, pred_type, reason, send_at in all_preds:
-                added = add_to_prediction_queue(pred_num, predicted_suit, pred_type, reason, send_at)
-                if added:
-                    label = type_labels_log.get(pred_type, pred_type)
-                    logger.info(f"{label}: #{pred_num} ({predicted_suit}) → envoi dès jeu #{send_at}")
-    else:
-        logger.info(f"⏸️ En pause, pas de nouvelle détection")
+    # 3. Générer et mettre en file les nouvelles prédictions (avec send_at = jeu de détection)
+    if compteur2_active or compteur3_active:
+        all_preds = get_all_counter_predictions(game_number)
+        type_labels_log = {
+            'compteur2':      '📊 C2 seul (inverse)',
+            'compteur2_c3':   '📊+🔄 C2+C3 (costume C2)',
+            'compteur3_seul': '🔁 C3 seul (manquant)',
+        }
+        for predicted_suit, pred_num, pred_type, reason, send_at in all_preds:
+            added = add_to_prediction_queue(pred_num, predicted_suit, pred_type, reason, send_at)
+            if added:
+                label = type_labels_log.get(pred_type, pred_type)
+                logger.info(f"{label}: #{pred_num} ({predicted_suit}) → envoi dès jeu #{send_at}")
 
     # 4. Traiter la file d'attente APRÈS ajout des nouvelles prédictions
     #    → les prédictions avec send_at = game_number sont envoyées immédiatement
@@ -1531,18 +1467,10 @@ async def cleanup_stale_predictions():
 
 async def auto_reset_system():
     """Mode veille avec vérification de pause bloquée et prédictions expirées."""
-    global pause_active, pause_end_time
     
     while True:
         try:
             await asyncio.sleep(60)
-            
-            # Vérifier pause bloquée
-            if pause_active and pause_end_time:
-                remaining = (pause_end_time - datetime.now()).total_seconds()
-                if remaining <= -30:
-                    logger.warning("🚨 Pause bloquée détectée (temps dépassé), auto-correction...")
-                    await end_pause()
             
             # Nettoyer les prédictions bloquées (timeout)
             if pending_predictions:
@@ -1555,7 +1483,6 @@ async def auto_reset_system():
 async def perform_full_reset(reason: str):
     global pending_predictions, last_prediction_time, waiting_finalization
     global last_prediction_number_sent, compteur2_trackers, prediction_queue
-    global pause_active, pause_counter, pause_cycle_index, pause_message_id, pause_end_time, pause_task
     global compteur1_trackers, compteur1_history, compteur3_trackers, prediction_history
 
     stats = len(pending_predictions)
@@ -1585,7 +1512,7 @@ async def perform_full_reset(reason: str):
             TYPE_LABELS_PDF = {
                 'compteur2':      'C2 seul -> inverse(C2)',
                 'compteur2_c3':   'C2+C3 -> costume C2',
-                'compteur3_seul': 'C3 seul -> inverse(C3)',
+                'compteur3_seul': 'C3 seul -> manquant(C3)',
                 'compteur3_inverse': 'C3 Inverse (legacy)',
                 'synchro_inverse':   'Synchro Inverse (legacy)',
             }
@@ -1610,16 +1537,6 @@ async def perform_full_reset(reason: str):
         except Exception as e:
             logger.error(f"❌ Erreur envoi PDF pré-reset: {e}")
 
-    if pause_active:
-        pause_active = False
-        if pause_task and not pause_task.done():
-            pause_task.cancel()
-            try:
-                await pause_task
-            except asyncio.CancelledError:
-                pass
-        pause_message_id = None
-        pause_end_time = None
 
     for tracker in compteur2_trackers.values():
         tracker.counter = 0
@@ -1638,13 +1555,11 @@ async def perform_full_reset(reason: str):
     waiting_finalization.clear()
     prediction_queue.clear()
     prediction_history.clear()
+    game_suit_log.clear()
+    game_suit_log3.clear()
     last_prediction_time = None
     last_prediction_number_sent = 0
-    suit_block_until.clear()
-    
-    pause_counter = 0
-    pause_cycle_index = 0
-    
+
     logger.info(f"🔄 {reason} - {stats} actives cleared, {queue_stats} file cleared, Compteurs reset")
     
     await notify_admin_reset(reason, stats, queue_stats)
@@ -1766,171 +1681,6 @@ async def cmd_stats(event):
         await event.respond(f"❌ Erreur: {e}")
 
 # Commandes existantes (pause, config, etc.)
-async def cmd_pause(event):
-    global pause_active, pause_counter, pause_cycle_index, PAUSE_CYCLE, PREDICTIONS_BEFORE_PAUSE
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    try:
-        parts = event.message.message.split()
-        
-        if len(parts) == 1:
-            status_pause = "🟢 ACTIVE" if pause_active else "🔴 INACTIVE"
-            
-            time_info = ""
-            if pause_active and pause_end_time:
-                remaining = int((pause_end_time - datetime.now()).total_seconds())
-                if remaining > 0:
-                    mins = remaining // 60
-                    secs = remaining % 60
-                    time_info = f"\n⏳ Temps restant: {mins}:{secs:02d}"
-                else:
-                    time_info = "\n⏳ Temps écoulé (devrait se terminer...)"
-            
-            current_duration = PAUSE_CYCLE[pause_cycle_index % len(PAUSE_CYCLE)] if not pause_active else "En cours"
-            
-            await event.respond(
-                f"⏸️ **SYSTÈME DE PAUSE**\n\n"
-                f"Statut: {status_pause}{time_info}\n\n"
-                f"📊 Configuration:\n"
-                f"• Cycle: {PAUSE_CYCLE} minutes\n"
-                f"• Prochaine pause: {current_duration} min\n"
-                f"• Prédictions avant pause: {PREDICTIONS_BEFORE_PAUSE}\n"
-                f"• Compteur actuel: {pause_counter}/{PREDICTIONS_BEFORE_PAUSE}\n"
-                f"• Cycle actuel: #{pause_cycle_index + 1}\n\n"
-                f"**Usage:**\n"
-                f"`/pause on` - Activer manuellement\n"
-                f"`/pause off` - Désactiver manuellement\n"
-                f"`/pausecycle 3,5,4` - Modifier le cycle\n"
-                f"`/pauseadd [texte]` - Ajouter expression reprise"
-            )
-            return
-        
-        arg = parts[1].lower()
-        
-        if arg == 'on':
-            if pause_active:
-                await event.respond("⏸️ Pause déjà active")
-                return
-            await start_pause()
-            await event.respond("✅ **Pause activée manuellement**")
-            
-        elif arg == 'off':
-            if not pause_active:
-                await event.respond("▶️ Pas de pause active")
-                return
-            await end_pause()
-            await event.respond("✅ **Pause désactivée manuellement**")
-            
-        else:
-            await event.respond("❌ Usage: `/pause` ou `/pause on/off`")
-            
-    except Exception as e:
-        logger.error(f"Erreur cmd_pause: {e}")
-        await event.respond(f"❌ Erreur: {e}")
-
-async def cmd_pausecycle(event):
-    global PAUSE_CYCLE
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    try:
-        parts = event.message.message.split()
-        
-        if len(parts) == 1:
-            cycle_text = f"🔄 **CYCLE DE PAUSE**\n\nCycle actuel: **{PAUSE_CYCLE}** minutes\n\nOrdre des pauses:\n"
-            
-            for i, duration in enumerate(PAUSE_CYCLE, 1):
-                cycle_text += f"{i}. Pause #{i}: {duration} minutes\n"
-            
-            cycle_text += f"\n**Usage:** `/pausecycle 3,5,4,6` (durées en minutes, séparées par des virgules)"
-            await event.respond(cycle_text)
-            return
-        
-        arg = parts[1]
-        try:
-            new_cycle = [int(x.strip()) for x in arg.split(',')]
-            
-            if len(new_cycle) < 1:
-                await event.respond("❌ Minimum 1 durée requise")
-                return
-            
-            if any(d <= 0 or d > 60 for d in new_cycle):
-                await event.respond("❌ Les durées doivent être entre 1 et 60 minutes")
-                return
-            
-            old_cycle = PAUSE_CYCLE
-            PAUSE_CYCLE = new_cycle
-            
-            await event.respond(
-                f"✅ **Cycle modifié**\n\n"
-                f"Ancien: {old_cycle}\n"
-                f"Nouveau: **{PAUSE_CYCLE}**"
-            )
-            logger.info(f"Admin change cycle pause: {old_cycle} → {PAUSE_CYCLE}")
-            
-        except ValueError:
-            await event.respond("❌ Format invalide. Usage: `/pausecycle 3,5,4`")
-            
-    except Exception as e:
-        logger.error(f"Erreur cmd_pausecycle: {e}")
-        await event.respond(f"❌ Erreur: {e}")
-
-async def cmd_pauseadd(event):
-    global RESUME_EXPRESSIONS
-    
-    if event.is_group or event.is_channel:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        await event.respond("🔒 Admin uniquement")
-        return
-    
-    try:
-        parts = event.message.message.split(' ', 1)
-        
-        if len(parts) < 2:
-            examples = random.sample(RESUME_EXPRESSIONS, min(5, len(RESUME_EXPRESSIONS)))
-            examples_text = "\n".join([f"{i+1}. {ex[:50]}..." for i, ex in enumerate(examples)])
-            
-            await event.respond(
-                f"📝 **EXPRESSIONS DE REPRISE**\n\n"
-                f"Nombre actuel: **{len(RESUME_EXPRESSIONS)}** expressions\n\n"
-                f"Exemples:\n{examples_text}\n\n"
-                f"**Usage:** `/pauseadd Votre expression ici - Sossou Kouamé`"
-            )
-            return
-        
-        new_expr = parts[1].strip()
-        
-        if len(new_expr) < 10:
-            await event.respond("❌ Expression trop courte (min 10 caractères)")
-            return
-        
-        if len(new_expr) > 200:
-            await event.respond("❌ Expression trop longue (max 200 caractères)")
-            return
-        
-        RESUME_EXPRESSIONS.append(new_expr)
-        
-        await event.respond(
-            f"✅ **Expression ajoutée**\n\n"
-            f"Total: {len(RESUME_EXPRESSIONS)} expressions\n"
-            f"Nouvelle: _{new_expr[:60]}..._"
-        )
-        logger.info(f"Admin ajoute expression pause: {new_expr[:50]}...")
-        
-    except Exception as e:
-        logger.error(f"Erreur cmd_pauseadd: {e}")
-        await event.respond(f"❌ Erreur: {e}")
-
 async def cmd_gap(event):
     global MIN_GAP_BETWEEN_PREDICTIONS
     
@@ -2030,26 +1780,252 @@ async def cmd_canal_compteur2(event):
 
 async def cmd_canaux(event):
     global COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID, SOURCE_CHANNEL_ID
-    
+    global CANAL_C2_ID, CANAL_C3_ID, CANAL_C2C3_ID
+
     if event.is_group or event.is_channel:
         return
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.respond("🔒 Admin uniquement")
         return
-    
+
+    def ch(val):
+        return f'`{val}`' if val else '❌'
+
     lines = [
         "📡 **CONFIGURATION DES CANAUX**",
         "",
         f"📥 **Source:** `{SOURCE_CHANNEL_ID}`",
         f"📤 **Principal:** `{PREDICTION_CHANNEL_ID}`",
         "",
-        f"📊 **Compteur2:** {f'`{COMPTEUR2_CHANNEL_ID}`' if COMPTEUR2_CHANNEL_ID else '❌'}",
+        "**Redirections par mode :**",
+        f"  📊 C2 seul    : {ch(CANAL_C2_ID)}",
+        f"  🔁 C3 seul    : {ch(CANAL_C3_ID)}",
+        f"  🔄 C2+C3 inv  : {ch(CANAL_C2C3_ID)}",
+        "",
+        f"📊 **Compteur2 (legacy):** {ch(COMPTEUR2_CHANNEL_ID)}",
+        "",
+        "Commande : `/redirect c2 [ID]` | `/redirect c3 [ID]` | `/redirect c2c3 [ID]` | `/redirect off`",
     ]
-    
+
     await event.respond("\n".join(lines))
 
+
+async def cmd_redirect(event):
+    """Configure la redirection d'un mode de prédiction vers un canal dédié.
+    Usage:
+      /redirect           — voir la config actuelle
+      /redirect c2 [ID]   — rediriger C2 seul → canal ID
+      /redirect c3 [ID]   — rediriger C3 seul → canal ID
+      /redirect c2c3 [ID] — rediriger C2+C3 inverses → canal ID
+      /redirect c2 off    — désactiver la redirection C2
+      /redirect c3 off    — désactiver la redirection C3
+      /redirect c2c3 off  — désactiver la redirection C2+C3
+      /redirect off       — désactiver toutes les redirections
+    """
+    global CANAL_C2_ID, CANAL_C3_ID, CANAL_C2C3_ID
+
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        parts = event.message.message.split()
+
+        def ch(val):
+            return f'`{val}`' if val else '❌'
+
+        if len(parts) == 1:
+            lines = [
+                "📡 **REDIRECTION PAR MODE**",
+                "",
+                f"  📊 C2 seul   → {ch(CANAL_C2_ID)}",
+                f"  🔁 C3 seul   → {ch(CANAL_C3_ID)}",
+                f"  🔄 C2+C3 inv → {ch(CANAL_C2C3_ID)}",
+                "",
+                "**Usage:**",
+                "  `/redirect c2 [ID]`    — définir le canal C2",
+                "  `/redirect c3 [ID]`    — définir le canal C3",
+                "  `/redirect c2c3 [ID]`  — définir le canal C2+C3",
+                "  `/redirect c2 off`     — désactiver C2",
+                "  `/redirect c3 off`     — désactiver C3",
+                "  `/redirect c2c3 off`   — désactiver C2+C3",
+                "  `/redirect off`        — tout désactiver",
+            ]
+            await event.respond("\n".join(lines))
+            return
+
+        mode = parts[1].lower()
+
+        # Désactiver tout
+        if mode == 'off':
+            CANAL_C2_ID = None
+            CANAL_C3_ID = None
+            CANAL_C2C3_ID = None
+            await event.respond("❌ **Toutes les redirections de mode désactivées**")
+            logger.info("Admin désactive toutes les redirections de mode")
+            return
+
+        if mode not in ('c2', 'c3', 'c2c3'):
+            await event.respond("❌ Mode invalide. Utilisez : `c2`, `c3`, `c2c3` ou `off`")
+            return
+
+        if len(parts) < 3:
+            await event.respond(f"❌ Usage : `/redirect {mode} [ID|off]`")
+            return
+
+        arg = parts[2].lower()
+        mode_name_map = {'c2': '📊 C2 seul', 'c3': '🔁 C3 seul', 'c2c3': '🔄 C2+C3 inverses'}
+        mode_label = mode_name_map[mode]
+
+        if arg == 'off':
+            if mode == 'c2':
+                old = CANAL_C2_ID; CANAL_C2_ID = None
+            elif mode == 'c3':
+                old = CANAL_C3_ID; CANAL_C3_ID = None
+            else:
+                old = CANAL_C2C3_ID; CANAL_C2C3_ID = None
+            await event.respond(f"❌ **Redirection {mode_label} désactivée** (était: `{old}`)")
+            logger.info(f"Admin désactive redirect {mode}")
+            return
+
+        try:
+            new_id = int(arg)
+        except ValueError:
+            await event.respond(f"❌ ID invalide : `{arg}`")
+            return
+
+        channel_entity = await resolve_channel(new_id)
+        if not channel_entity:
+            await event.respond(f"❌ Canal `{new_id}` inaccessible ou introuvable")
+            return
+
+        if mode == 'c2':
+            old = CANAL_C2_ID; CANAL_C2_ID = new_id
+        elif mode == 'c3':
+            old = CANAL_C3_ID; CANAL_C3_ID = new_id
+        else:
+            old = CANAL_C2C3_ID; CANAL_C2C3_ID = new_id
+
+        chan_title = getattr(channel_entity, 'title', str(new_id))
+        await event.respond(
+            f"✅ **Redirection {mode_label}**\n\n"
+            f"Canal : **{chan_title}** (`{new_id}`)\n"
+            f"Ancienne valeur : `{old}`\n\n"
+            f"Les prédictions de ce mode seront envoyées au canal principal ET à ce canal."
+        )
+        logger.info(f"Admin redirect {mode}: {old} → {new_id}")
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_redirect: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+async def cmd_ecarts(event):
+    """Affiche les écarts de costumes entre les jeux 1 et 1440.
+    Usage:
+      /ecarts         — rapport texte + PDF si données disponibles
+      /ecarts [N]     — limiter au jeu N (au lieu de 1440)
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        parts = event.message.message.split()
+        max_g = 1440
+        if len(parts) >= 2:
+            try:
+                max_g = int(parts[1])
+                max_g = max(1, min(max_g, 1440))
+            except ValueError:
+                pass
+
+        nb_jeux = len([g for g in game_suit_log if g <= max_g])
+        if nb_jeux == 0:
+            await event.respond(
+                f"❌ Aucune donnée enregistrée pour les jeux 1→{max_g}.\n"
+                f"Le bot doit avoir reçu des jeux depuis son démarrage."
+            )
+            return
+
+        await event.respond(f"⏳ Calcul des écarts sur {nb_jeux} jeux enregistrés (1→{max_g})…")
+
+        ecarts = compute_ecarts(max_g)
+
+        # Affichage texte (limité à 4000 chars)
+        txt = build_ecarts_text(ecarts, max_g)
+        MAX_MSG = 4000
+        if len(txt) <= MAX_MSG:
+            await event.respond(txt)
+        else:
+            # Envoyer par blocs
+            for chunk_start in range(0, len(txt), MAX_MSG):
+                await event.respond(txt[chunk_start:chunk_start + MAX_MSG])
+
+        # Générer et envoyer le PDF
+        admin_entity = await client.get_input_entity(event.sender_id)
+        await generate_and_send_ecarts_pdf(admin_entity, ecarts, max_g)
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_ecarts: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+async def cmd_ecarts3(event):
+    """Affiche les écarts de costumes du 2ème groupe (Banquier) entre les jeux 1 et 1440.
+    Usage:
+      /ecarts3         — rapport texte + PDF si données disponibles
+      /ecarts3 [N]     — limiter au jeu N (au lieu de 1440)
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        parts = event.message.message.split()
+        max_g = 1440
+        if len(parts) >= 2:
+            try:
+                max_g = int(parts[1])
+                max_g = max(1, min(max_g, 1440))
+            except ValueError:
+                pass
+
+        nb_jeux = len([g for g in game_suit_log3 if g <= max_g])
+        if nb_jeux == 0:
+            await event.respond(
+                f"❌ Aucune donnée enregistrée pour le 2ème groupe (jeux 1→{max_g}).\n"
+                f"Le bot doit avoir reçu des jeux avec un 2ème groupe de parenthèses."
+            )
+            return
+
+        await event.respond(f"⏳ Calcul des écarts (2ème groupe) sur {nb_jeux} jeux enregistrés (1→{max_g})…")
+
+        ecarts = compute_ecarts(max_g, suit_log=game_suit_log3)
+
+        # Affichage texte (limité à 4000 chars)
+        txt = build_ecarts_text(ecarts, max_g, title="Banquier")
+        MAX_MSG = 4000
+        if len(txt) <= MAX_MSG:
+            await event.respond(txt)
+        else:
+            for chunk_start in range(0, len(txt), MAX_MSG):
+                await event.respond(txt[chunk_start:chunk_start + MAX_MSG])
+
+        # Générer et envoyer le PDF
+        admin_entity = await client.get_input_entity(event.sender_id)
+        await generate_and_send_ecarts_pdf(admin_entity, ecarts, max_g, title="Banquier")
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_ecarts3: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
 async def cmd_queue(event):
-    global prediction_queue, current_game_number, MIN_GAP_BETWEEN_PREDICTIONS, PREDICTION_SEND_AHEAD, pause_active
     
     if event.is_group or event.is_channel:
         return
@@ -2058,10 +2034,6 @@ async def cmd_queue(event):
         return
     
     try:
-        if pause_active:
-            await event.respond("⏸️ **En pause** - File d'attente figée")
-            return
-        
         lines = [
             "📋 **FILE D'ATTENTE**",
             f"Écart: {MIN_GAP_BETWEEN_PREDICTIONS} | Envoi: N-{PREDICTION_SEND_AHEAD}",
@@ -2196,7 +2168,6 @@ async def cmd_history(event):
 
 async def cmd_status(event):
     global compteur2_active, compteur2_seuil_B
-    global COMPTEUR2_CHANNEL_ID, pause_active, pause_counter, PREDICTIONS_BEFORE_PAUSE, PAUSE_CYCLE
     global compteur3_active, compteur3_seuil_B2, COMPTEUR3_Z
 
     if event.is_group or event.is_channel:
@@ -2207,7 +2178,6 @@ async def cmd_status(event):
 
     compteur2_str = "✅ ON" if compteur2_active else "❌ OFF"
     compteur3_str = "✅ ON" if compteur3_active else "❌ OFF"
-    pause_str = "🟢 ACTIVE" if pause_active else "🔴 INACTIVE"
 
     now = datetime.now()
 
@@ -2217,8 +2187,6 @@ async def cmd_status(event):
         f"📊 Compteur2: {compteur2_str} (B={compteur2_seuil_B})",
         f"🔄 Compteur3: {compteur3_str} (B2={compteur3_seuil_B2} | Z={COMPTEUR3_Z})",
         f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}",
-        f"⏸️ Pause: {pause_str} ({pause_counter}/{PREDICTIONS_BEFORE_PAUSE})",
-        f"🔄 Cycle pause: {PAUSE_CYCLE}",
         f"📋 File: {len(prediction_queue)} | Actives: {len(pending_predictions)}",
         f"🎮 Canal: #{current_game_number}",
         "",
@@ -2249,8 +2217,11 @@ async def _generate_and_send_pdf(get_sender_fn, preds, header_lines, total, nb_g
     from reportlab.lib.units import mm
     from reportlab.lib import colors
 
+    _PDF_SUIT_NAMES = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+
     def clean(s):
         for old, new in [
+            ('✅', ''), ('❌', ''), ('❓', '[?]'),
             ('♠️','Pique'), ('❤️','Coeur'), ('♦️','Carreau'), ('♣️','Trefle'),
             ('♠','Pique'), ('♥','Coeur'), ('♦','Carreau'), ('♣','Trefle'),
             ('🏆','[W]'), ('💔','[L]'), ('🎰','[?]'), ('🔄',''), ('🔁',''),
@@ -2282,7 +2253,7 @@ async def _generate_and_send_pdf(get_sender_fn, preds, header_lines, total, nb_g
     story.append(Spacer(1, 5*mm))
 
     for i, pred in enumerate(preds, 1):
-        suit_disp = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
+        suit_disp = _PDF_SUIT_NAMES.get(pred['suit'], pred['suit'])
         status_txt = STATUS_ICONS.get(pred['status'], '?')
         pred_type = TYPE_LABELS.get(pred['type'], pred['type'])
         reason = pred.get('reason_text', '-')
@@ -2333,7 +2304,7 @@ async def cmd_informations(event):
         TYPE_LABELS = {
             'compteur2':      '📊 C2 seul → inverse(C2)',
             'compteur2_c3':   '📊+🔄 C2+C3 → costume C2',
-            'compteur3_seul': '🔁 C3 seul → inverse(C3)',
+            'compteur3_seul': '🔁 C3 seul → manquant(C3)',
             # anciens types (rétrocompatibilité historique)
             'compteur3_inverse': '🔄 C3 Inverse (legacy)',
             'synchro_inverse':   '🔁 Synchro Inverse (legacy)',
@@ -2455,7 +2426,7 @@ async def cmd_help(event):
 `/modepredict` - Voir le mode actuel
 `/modepredict all` - Toutes les règles simultanément (défaut)
 `/modepredict c2only` - C2 ≥ B → inverse(C2) lancé à source, numéro source+E
-`/modepredict c3only` - C3 ≥ B → inverse(C3) lancé à source, numéro source+Z
+`/modepredict c3only` - C3 ≥ B → manquant(C3) lancé à source, numéro source+Z
 `/modepredict c2c3inverse` - C2+C3 inverses → costume C2 lancé à source, numéro source+F
 
 **⚡ Offsets de prédiction:**
@@ -2463,14 +2434,20 @@ async def cmd_help(event):
 `/setz [1-20]` - Z : numéro cible mode c3only (actuel: {COMPTEUR3_Z})
 `/setf [1-20]` - F : numéro cible mode c2c3inverse (actuel: {COMPTEUR3_F})
 
-**📡 Canaux:**
-`/canalcompteur2 [ID/off]`
-`/canaux` - Voir config
+**📡 Canaux & Redirections:**
+`/canaux` - Voir config des canaux
+`/redirect` - Voir redirections par mode
+`/redirect c2 [ID]` - Rediriger C2 vers canal ID
+`/redirect c3 [ID]` - Rediriger C3 vers canal ID
+`/redirect c2c3 [ID]` - Rediriger C2+C3 vers canal ID
+`/redirect off` - Désactiver toutes redirections
+`/canalcompteur2 [ID/off]` - Canal legacy C2
 
-**⏸️ Pause:**
-`/pause [on/off]` - Gérer pause
-`/pausecycle [3,5,4]` - Modifier cycle
-`/pauseadd [texte]` - Ajouter expression
+**📊 Écarts (absences consécutives #1→#1440):**
+`/ecarts` - Rapport + PDF des écarts 1er groupe (Joueurs)
+`/ecarts [N]` - Limiter au jeu N (ex: /ecarts 720)
+`/ecarts3` - Rapport + PDF des écarts 2ème groupe (Banquier)
+`/ecarts3 [N]` - Limiter au jeu N (ex: /ecarts3 720)
 
 **📋 Gestion:**
 `/informations` - Liste complète des prédictions (PDF si trop long)
@@ -2482,7 +2459,7 @@ async def cmd_help(event):
 
 ℹ️ **Logique des prédictions:**
 • C2 seul ≥ B → inverse(C2) au numéro source+E
-• C3 seul ≥ B → inverse(C3) au numéro source+Z
+• C3 seul ≥ B → manquant(C3) au numéro source+Z
 • C2+C3 inverses → costume C2 au numéro source+F
 → La prédiction est lancée **immédiatement** au jeu de détection
 
@@ -2646,8 +2623,8 @@ async def cmd_setz(event):
             await event.respond(
                 f"⚡ **VALEUR Z — OFFSET C3 SEUL**\n\n"
                 f"Valeur actuelle: **Z = {COMPTEUR3_Z}**\n\n"
-                f"Utilisé quand C3 seul atteint B (C2 inverse absent) :\n"
-                f"  prédiction = inverse(C3) au numéro **source + Z**\n\n"
+                f"Utilisé quand C3 seul atteint B (C2 absent) :\n"
+                f"  prédiction = costume manquant(C3) au numéro **source + Z**\n\n"
                 f"**Usage:** `/setz [1-20]`"
             )
             return
@@ -2659,7 +2636,7 @@ async def cmd_setz(event):
                 return
             old_z = COMPTEUR3_Z
             COMPTEUR3_Z = z_val
-            await event.respond(f"✅ **Z modifié: {old_z} → {z_val}**\n\nPrédiction inverse = dernier numéro + {z_val}")
+            await event.respond(f"✅ **Z modifié: {old_z} → {z_val}**\n\nPrédiction costume manquant C3 = dernier numéro + {z_val}")
             logger.info(f"Admin change COMPTEUR3_Z: {old_z} → {z_val}")
         except ValueError:
             await event.respond("❌ Usage: `/setz [1-20]`")
@@ -2833,9 +2810,9 @@ async def cmd_modepredict(event):
     try:
         parts = event.message.message.split()
         MODE_LABELS = {
-            'all':         f'🔀 Toutes les règles (C2→inverse(C2) à +E, C3→inverse(C3) à +Z, C2+C3inv→C2 à +F)',
+            'all':         f'🔀 Toutes les règles (C2→inverse(C2) à +E, C3→manquant(C3) à +Z, C2+C3inv→C2 à +F)',
             'c2only':      f'📊 C2 seul → prédit inverse(C2) au numéro source + E ({COMPTEUR3_E})',
-            'c3only':      f'🔁 C3 seul → prédit inverse(C3) au numéro source + Z ({COMPTEUR3_Z})',
+            'c3only':      f'🔁 C3 seul → prédit costume manquant(C3) au numéro source + Z ({COMPTEUR3_Z})',
             'c2c3inverse': f'🔄 C2 et C3 inverses → prédit costume C2 au numéro source + F ({COMPTEUR3_F})',
         }
 
@@ -2850,7 +2827,7 @@ async def cmd_modepredict(event):
                 "Modes disponibles :",
                 "  `/modepredict all`         — Toutes les règles simultanément (défaut)",
                 f"  `/modepredict c2only`      — C2 ≥ B → inverse(C2) à source+E ({COMPTEUR3_E})",
-                f"  `/modepredict c3only`      — C3 ≥ B → inverse(C3) à source+Z ({COMPTEUR3_Z})",
+                f"  `/modepredict c3only`      — C3 ≥ B → manquant(C3) à source+Z ({COMPTEUR3_Z})",
                 f"  `/modepredict c2c3inverse` — C2+C3 inverses → costume C2 à source+F ({COMPTEUR3_F})",
             ]
             await event.respond("\n".join(lines))
@@ -2898,16 +2875,12 @@ async def cmd_reset(event):
 def setup_handlers():
     # Configuration
     client.add_event_handler(cmd_gap, events.NewMessage(pattern=r'^/gap'))
-    
-    # Canaux
+
+    # Canaux et redirections
     client.add_event_handler(cmd_canal_compteur2, events.NewMessage(pattern=r'^/canalcompteur2'))
     client.add_event_handler(cmd_canaux, events.NewMessage(pattern=r'^/canaux$'))
-    
-    # Pause
-    client.add_event_handler(cmd_pause, events.NewMessage(pattern=r'^/pause'))
-    client.add_event_handler(cmd_pausecycle, events.NewMessage(pattern=r'^/pausecycle'))
-    client.add_event_handler(cmd_pauseadd, events.NewMessage(pattern=r'^/pauseadd'))
-    
+    client.add_event_handler(cmd_redirect, events.NewMessage(pattern=r'^/redirect'))
+
     # Compteurs et stats
     client.add_event_handler(cmd_compteur1, events.NewMessage(pattern=r'^/compteur1$'))
     client.add_event_handler(cmd_stats, events.NewMessage(pattern=r'^/stats$'))
@@ -2917,6 +2890,10 @@ def setup_handlers():
     client.add_event_handler(cmd_setf, events.NewMessage(pattern=r'^/setf'))
     client.add_event_handler(cmd_synchro, events.NewMessage(pattern=r'^/synchro$'))
     client.add_event_handler(cmd_informations, events.NewMessage(pattern=r'^/informations$'))
+
+    # Écarts
+    client.add_event_handler(cmd_ecarts3, events.NewMessage(pattern=r'^/ecarts3'))
+    client.add_event_handler(cmd_ecarts, events.NewMessage(pattern=r'^/ecarts(?!3)'))
 
     # Mode de prédiction
     client.add_event_handler(cmd_modepredict, events.NewMessage(pattern=r'^/modepredict'))
@@ -2929,7 +2906,7 @@ def setup_handlers():
     client.add_event_handler(cmd_history, events.NewMessage(pattern=r'^/history$'))
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
-    
+
     # Messages
     client.add_event_handler(handle_new_message, events.NewMessage())
     client.add_event_handler(handle_edited_message, events.MessageEdited())
@@ -2980,12 +2957,10 @@ async def main():
         
         logger.info(f"🌐 Web server port {PORT}")
         logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
-        logger.info(f"⏸️ Pause cycle: {PAUSE_CYCLE} min")
         logger.info(f"📡 Multi-canaux: ACTIVE")
         logger.info(f"🎯 Compteur1 (présences): ACTIVE")
         logger.info(f"🔄 Compteur3 (2ème groupe B2={compteur3_seuil_B2} Z={COMPTEUR3_Z}): ACTIVE")
-        logger.info(f"✅ Système de pause corrigé")
-        
+
         await client.run_until_disconnected()
         
     except Exception as e:
