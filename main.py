@@ -3,6 +3,7 @@ import asyncio
 import re
 import logging
 import sys
+import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta
@@ -79,6 +80,12 @@ prediction_history: List[Dict] = []
 # File d'attente de prédictions (plusieurs prédictions possibles)
 prediction_queue: List[Dict] = []  # File ordonnée des prédictions en attente
 PREDICTION_SEND_AHEAD = 2  # Envoyer la prédiction quand canal source est à N-2
+BILAN_INTERVAL_MINUTES = 20  # Intervalle auto-bilan en minutes (modifiable par admin)
+_last_auto_bilan_time = None  # Horodatage du dernier bilan automatique envoyé
+
+# Snapshots horodatés du bilan (accumulés sur tout le cycle, effacés seulement au #1440)
+bilan_snapshots: list = []   # [{ts, game, stats_per_mode}, ...]
+ecart_snapshots: list = []   # [{ts, game, max_ecarts_g1, max_ecarts_g3}, ...]
 
 # Canaux secondaires pour redirection
 COMPTEUR2_CHANNEL_ID = None     # Canal spécifique pour Compteur2 (legacy)
@@ -443,8 +450,8 @@ def compute_ecarts(max_game: int = 1440, suit_log: Dict = None) -> Dict[str, Lis
 
             if suit in suits_here:
                 # Costume présent
-                if absent_start is not None:
-                    # Fin d'une période d'absence
+                if absent_start is not None and last_seen > 0:
+                    # Fin d'une période d'absence (uniquement si le costume avait déjà été vu)
                     ecart_val = g - last_seen - 1
                     if ecart_val >= 1:
                         result[suit].append({
@@ -452,15 +459,15 @@ def compute_ecarts(max_game: int = 1440, suit_log: Dict = None) -> Dict[str, Lis
                             'end': g,
                             'ecart': ecart_val,
                         })
-                    absent_start = None
+                absent_start = None
                 last_seen = g
             else:
-                # Costume absent
-                if absent_start is None:
+                # Costume absent — on ne commence à compter qu'après la première apparition
+                if absent_start is None and last_seen > 0:
                     absent_start = g
 
-        # Si absence encore en cours à la fin
-        if absent_start is not None and last_seen < max_game:
+        # Si absence encore en cours à la fin (seulement si le costume a été vu au moins une fois)
+        if absent_start is not None and last_seen > 0 and last_seen < max_game:
             ecart_val = max_game - last_seen
             if ecart_val >= 1:
                 result[suit].append({
@@ -591,7 +598,8 @@ async def generate_and_send_ecarts_pdf(recipient, ecarts_by_suit: Dict[str, List
         buf,
         caption=caption,
         file_name=f"ecarts_costumes_{file_tag}_{max_game}.pdf",
-        force_document=True
+        force_document=True,
+        mime_type='application/pdf'
     )
 
 
@@ -615,6 +623,11 @@ async def _send_ecarts_auto(game_number: int):
                 await generate_and_send_ecarts_pdf(pred_entity, ecarts1, max_g, title="Joueurs.....")
                 await generate_and_send_ecarts_pdf(pred_entity, ecarts3, max_g, title="Banquier")
                 logger.info(f"✅ PDFs écarts envoyés au canal prédictions")
+
+        # Snapshot écarts + bilan final de fin de journée au jeu #1440
+        await _save_ecart_snapshot(max_g)
+        await send_bilan_to_all(is_final=True)
+        logger.info(f"📊 Bilan final #1440 envoyé")
     except Exception as e:
         logger.error(f"❌ Erreur envoi écarts auto: {e}")
 
@@ -664,7 +677,7 @@ def get_suits_in_group(group_str: str) -> List[str]:
 
 def format_prediction_message(game_number: int, suit: str, status: str = 'en_cours', 
                              current_check: int = None, verified_games: List[int] = None,
-                             rattrapage: int = 0) -> str:
+                             rattrapage: int = 0, is_initial: bool = False) -> str:
     suit_display = SUIT_DISPLAY.get(suit, suit)
     
     if status == 'en_cours':
@@ -673,19 +686,24 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
         for i in range(4):
             check_num = game_number + i
             
-            if current_check == check_num:
-                verif_parts.append(f"🔵#{check_num}")
-            elif verified_games and check_num in verified_games:
-                continue
+            if verified_games and check_num in verified_games:
+                continue  # Jeu déjà vérifié → retiré de l'affichage
+            elif current_check == check_num:
+                verif_parts.append(f"🔵{check_num}")  # Numéro toujours visible
             else:
-                verif_parts.append(f"⬜#{check_num}")
+                verif_parts.append(f"⬜{check_num}")
         
         verif_line = " | ".join(verif_parts)
         
-        return f"""🎰 PRÉDICTION #{game_number}
+        if is_initial:
+            return f"""🎰 PRÉDICTION #{game_number}
 🎯 Couleur: {suit_display}
 📊 Statut: En cours ⏳
 🔍 Vérification: {verif_line}"""
+        else:
+            return f"""🎰 PRÉDICTION #{game_number}
+🎯 Couleur: {suit_display}
+🔍 Vérification en cours : ⏳{verif_line}"""
     
     elif status == 'gagne':
         if rattrapage == 0:
@@ -721,7 +739,7 @@ async def send_prediction_to_channel(channel_id: int, game_number: int, suit: st
             logger.error(f"❌ Canal {channel_id} inaccessible")
             return None
         
-        msg = format_prediction_message(game_number, suit, 'en_cours', game_number, [])
+        msg = format_prediction_message(game_number, suit, 'en_cours', game_number, [], is_initial=True)
         
         sent = await client.send_message(channel_entity, msg, parse_mode='markdown')
         logger.info(f"✅ Envoyé à {'canal secondaire' if is_secondary else 'canal principal'} {channel_id}: #{game_number} {suit}")
@@ -1287,7 +1305,7 @@ async def process_game_result(game_number: int, message_text: str):
         if current_game_number >= 1440:
             logger.warning(f"🚨 RESET #1440 atteint (pas de groupe)")
             await _send_ecarts_auto(game_number)
-            await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
+            await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint", is_1440_reset=True)
         return
 
     first_group = groups[0]
@@ -1301,7 +1319,7 @@ async def process_game_result(game_number: int, message_text: str):
     if current_game_number >= 1440:
         logger.warning(f"🚨 RESET #1440 atteint")
         await _send_ecarts_auto(game_number)
-        await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint")
+        await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint", is_1440_reset=True)
         return
     
     # NOUVEAU: Mettre à jour Compteur1 (présences consécutives)
@@ -1480,10 +1498,11 @@ async def auto_reset_system():
             logger.error(f"❌ Erreur auto_reset: {e}")
             await asyncio.sleep(60)
 
-async def perform_full_reset(reason: str):
+async def perform_full_reset(reason: str, is_1440_reset: bool = False):
     global pending_predictions, last_prediction_time, waiting_finalization
     global last_prediction_number_sent, compteur2_trackers, prediction_queue
     global compteur1_trackers, compteur1_history, compteur3_trackers, prediction_history
+    global bilan_snapshots, ecart_snapshots
 
     stats = len(pending_predictions)
     queue_stats = len(prediction_queue)
@@ -1559,6 +1578,12 @@ async def perform_full_reset(reason: str):
     game_suit_log3.clear()
     last_prediction_time = None
     last_prediction_number_sent = 0
+
+    # Snapshots bilan/écarts : effacés UNIQUEMENT au reset #1440
+    if is_1440_reset:
+        bilan_snapshots.clear()
+        ecart_snapshots.clear()
+        logger.info("🗑️ Snapshots bilan/écarts réinitialisés (cycle #1440 terminé)")
 
     logger.info(f"🔄 {reason} - {stats} actives cleared, {queue_stats} file cleared, Compteurs reset")
     
@@ -2283,7 +2308,8 @@ async def _generate_and_send_pdf(get_sender_fn, preds, header_lines, total, nb_g
         buf,
         caption=caption,
         file_name="predictions_baccarat.pdf",
-        force_document=True
+        force_document=True,
+        mime_type='application/pdf'
     )
 
 
@@ -2348,7 +2374,7 @@ async def cmd_informations(event):
             lines.append(SEP)
             return lines
 
-        MAX_IN_CHAT = 10
+        MAX_IN_CHAT = 100
 
         if total == 0:
             await event.respond(
@@ -2869,6 +2895,600 @@ async def cmd_reset(event):
     await event.respond("✅ Reset effectué!")
 
 # ============================================================================
+# BILAN PAR MODE — AVEC SNAPSHOTS HISTORIQUES
+# ============================================================================
+
+STRATEGY_NAMES = {
+    'compteur2':      'Abracadabra',
+    'compteur3_seul': 'Cobra',
+    'compteur2_c3':   'Python Pro',
+}
+MODES_ORDER = ['compteur2', 'compteur3_seul', 'compteur2_c3']
+
+
+def compute_bilan_by_mode(history: list) -> dict:
+    """Calcule les stats de prédictions par mode (hors en_cours)."""
+    stats = {}
+    for mode in MODES_ORDER:
+        preds = [p for p in history if p.get('type') == mode and p.get('status') != 'en_cours']
+        r0 = sum(1 for p in preds if p.get('status') in ('gagne_r0', 'gagne'))
+        r1 = sum(1 for p in preds if p.get('status') == 'gagne_r1')
+        r2 = sum(1 for p in preds if p.get('status') == 'gagne_r2')
+        r3 = sum(1 for p in preds if p.get('status') == 'gagne_r3')
+        perdu = sum(1 for p in preds if p.get('status') == 'perdu')
+        total = len(preds)
+        gagnes = r0 + r1 + r2 + r3
+        pct_win = round(gagnes / total * 100, 1) if total > 0 else 0.0
+        pct_lose = round(perdu / total * 100, 1) if total > 0 else 0.0
+        stats[mode] = {
+            'total': total,
+            'r0': r0, 'r1': r1, 'r2': r2, 'r3': r3,
+            'perdu': perdu,
+            'gagnes': gagnes,
+            'pct_win': pct_win,
+            'pct_lose': pct_lose,
+        }
+    return stats
+
+
+def format_bilan_message(stats: dict, now_str: str, game: int = 0) -> str:
+    """Formate le message de bilan des 3 modes."""
+    game_str = f" — Jeu #{game}" if game > 0 else ""
+    lines = [
+        f"📊 **BILAN DES STRATÉGIES{game_str}**",
+        f"_{now_str}_",
+        "",
+    ]
+    for mode in MODES_ORDER:
+        name = STRATEGY_NAMES[mode]
+        s = stats[mode]
+        lines += [
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"🎯 **Stratégie {name}**",
+            f"📌 Total : {s['total']} prédiction(s)",
+            f"✅0️⃣ Gagné Direct : {s['r0']}",
+            f"✅1️⃣ Gagné R1     : {s['r1']}",
+            f"✅2️⃣ Gagné R2     : {s['r2']}",
+            f"✅3️⃣ Gagné R3     : {s['r3']}",
+            f"❌ Perdu          : {s['perdu']}",
+            f"📈 Taux gain  : {s['pct_win']}%",
+            f"📉 Taux perte : {s['pct_lose']}%",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Ressources textuelles pour les conseils
+# ---------------------------------------------------------------------------
+_PROVERBES = [
+    "« La patience est la mère de toutes les vertus. » — Proverbe africain",
+    "« Celui qui attend voit loin. » — Sagesse béninoise",
+    "« Un oiseau dans la main vaut mieux que deux dans la brousse. »",
+    "« La précipitation vient du diable, la patience vient de Dieu. » — Proverbe arabe",
+    "« Ne parie jamais ce que tu ne peux pas te permettre de perdre. » — Règle d'or du joueur sage",
+    "« L'eau qui coule doucement creuse la pierre. » — Proverbe africain",
+    "« Mieux vaut une petite victoire certaine qu'une grande victoire douteuse. »",
+    "« Connais ton ennemi et connais-toi toi-même. » — Sun Tzu",
+]
+_BLAGUES = [
+    "😄 Le baccarat, c'est comme la vie : parfois tu gagnes, parfois tu apprends !",
+    "😂 Pourquoi le joueur sage attend-il ? Parce que les billets n'aiment pas être pressés !",
+    "🤣 Sossou Kouamé dit : 'Si la stratégie Cobra te mord, c'est que tu n'as pas attendu l'écart !'",
+    "😆 La différence entre un bon joueur et un mauvais ? Le bon joue les données, le mauvais joue les émotions !",
+    "😁 Rappel du jour : le bot prédit, mais c'est toi qui décides de miser ou pas. Sage decision = portefeuille en bonne santé 💰",
+    "😂 Sossou Kouamé a dit un jour : 'J'ai perdu une fois en ne suivant pas les données. Je n'ai pas recommencé !'",
+]
+_SUIT_DISPLAY_CONSEIL = {
+    '♠': '♠️ Pique',
+    '♥': '❤️ Cœur',
+    '♦': '♦️ Carreau',
+    '♣': '♣️ Trèfle',
+}
+
+
+def _count_suit_freq(suit_log: dict, start_g: int, end_g: int) -> dict:
+    """Compte les apparitions de chaque costume entre start_g et end_g."""
+    freq = {s: 0 for s in ALL_SUITS}
+    total_games = 0
+    for g in range(start_g, end_g + 1):
+        suits_here = suit_log.get(g)
+        if suits_here is None:
+            continue
+        total_games += 1
+        for s in suits_here:
+            if s in freq:
+                freq[s] += 1
+    return freq, total_games
+
+
+def _freq_comment(freq: dict, total_games: int, start_g: int, end_g: int) -> list:
+    """Génère le bloc d'analyse des fréquences de costumes."""
+    if total_games == 0:
+        return ["  Aucune donnée de jeu disponible pour cette période."]
+    lines = [f"  Analyse des costumes du jeu #{start_g} au jeu #{end_g} ({total_games} jeux) :"]
+    sorted_suits = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    max_count = sorted_suits[0][1]   # valeur la plus haute (1er dans le tri décroissant)
+    min_count = sorted_suits[-1][1]  # valeur la plus basse (dernier dans le tri décroissant)
+    all_equal = (max_count == min_count)
+    for rank, (suit, count) in enumerate(sorted_suits):
+        name = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
+        pct = round(count / total_games * 100, 1) if total_games > 0 else 0
+        bar = "█" * min(int(pct / 5), 20)
+        if all_equal:
+            comment = "fréquence équilibrée"
+        elif rank == 0:
+            comment = "⬆️ costume dominant"
+        elif rank == len(sorted_suits) - 1:
+            comment = "⬇️ costume le plus rare — surveiller les écarts !"
+        elif pct >= 25:
+            comment = "fréquence normale"
+        else:
+            comment = "légèrement en retrait"
+        lines.append(f"  {name} : {count}× ({pct}%) {bar} — {comment}")
+    if not all_equal:
+        dominant_suit, dominant_count = sorted_suits[0]
+        rarest_suit, rarest_count = sorted_suits[-1]
+        dominant_name = _SUIT_DISPLAY_CONSEIL.get(dominant_suit, dominant_suit)
+        rarest_name = _SUIT_DISPLAY_CONSEIL.get(rarest_suit, rarest_suit)
+        lines += [
+            "",
+            f"  🔍 Costume dominant : **{dominant_name}** ({dominant_count}×) — présent très fréquemment.",
+            f"  🔍 Costume rare     : **{rarest_name}** ({rarest_count}×) — risque d'écart important en cours ou à venir.",
+        ]
+    else:
+        lines += ["", "  🔍 Fréquences équilibrées entre tous les costumes — aucun écart structurel détecté."]
+    return lines
+
+
+def _mode_analyse_rich(mode: str, s: dict) -> list:
+    """Analyse riche et précise d'un mode de prédiction."""
+    name = STRATEGY_NAMES[mode]
+    icon = {"compteur2": "🔮", "compteur3_seul": "🐍", "compteur2_c3": "🐍🔮"}[mode]
+    if s['total'] == 0:
+        return [f"  {icon} **{name}** : aucune prédiction enregistrée sur cette période."]
+    lines = [f"  {icon} **Stratégie {name}** ({s['total']} prédiction(s)) :"]
+    # Taux global
+    if s['pct_win'] >= 75:
+        lines.append(f"     ✨ Excellente performance : {s['pct_win']}% de réussite")
+    elif s['pct_win'] >= 55:
+        lines.append(f"     👍 Bonne performance : {s['pct_win']}% de réussite")
+    elif s['pct_win'] >= 40:
+        lines.append(f"     ⚠️ Performance moyenne : {s['pct_win']}% — à surveiller")
+    else:
+        lines.append(f"     ❌ Performance insuffisante : {s['pct_win']}% — prudence requise")
+    # Détail gains
+    lines.append(f"     • Gains directs  ✅0️⃣ : {s['r0']}  |  Rattrapage R1 ✅1️⃣ : {s['r1']}")
+    lines.append(f"     • Rattrapage R2 ✅2️⃣ : {s['r2']}  |  Rattrapage R3 ✅3️⃣ : {s['r3']}")
+    lines.append(f"     • Pertes ❌ : {s['perdu']}")
+    # Commentaires précis
+    heavy_ratt = s['r2'] + s['r3']
+    if s['r0'] > 0 and s['total'] > 0 and s['r0'] / s['total'] >= 0.45:
+        lines.append(f"     💎 Fort taux de gains directs ({s['r0']} sur {s['total']}) — stratégie très efficace ici.")
+    if heavy_ratt > 0 and s['total'] > 0 and heavy_ratt / s['total'] > 0.25:
+        lines.append(f"     💸 Rattrapages coûteux fréquents (R2+R3 = {heavy_ratt}) — gestion de bankroll importante.")
+    if s['perdu'] > 0 and s['total'] > 0 and s['perdu'] / s['total'] > 0.4:
+        lines.append(f"     🚨 Taux de perte élevé ({s['pct_lose']}%) — envisager de pausser cette stratégie.")
+    elif s['perdu'] == 0:
+        lines.append(f"     🏆 Aucune perte enregistrée — stratégie au top !")
+    return lines
+
+
+def format_conseil_message(stats: dict, snapshots: list = None) -> str:
+    """Conseil intermédiaire riche, visuellement attrayant, avec fréquences + proverbe + blague."""
+    ranked = sorted(
+        MODES_ORDER,
+        key=lambda m: (stats[m]['pct_win'], stats[m]['gagnes']),
+        reverse=True
+    )
+    best = ranked[0]
+    worst = ranked[-1]
+    best_name = STRATEGY_NAMES[best]
+    worst_name = STRATEGY_NAMES[worst]
+
+    # En-tête
+    now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
+    start_g = min(game_suit_log.keys()) if game_suit_log else 1
+    end_g = current_game_number if current_game_number > 0 else (max(game_suit_log.keys()) if game_suit_log else 1)
+
+    lines = [
+        "╔══════════════════════════╗",
+        "║  💡 CONSEIL SOSSOU KOUAMÉ  ║",
+        "╚══════════════════════════╝",
+        f"_Période analysée : jeu #{start_g} → #{end_g} | {now_str}_",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🏆 **CLASSEMENT DES STRATÉGIES**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, mode in enumerate(ranked):
+        s = stats[mode]
+        bar_filled = int(s['pct_win'] / 10)
+        bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+        lines.append(f"{medals[i]} **{STRATEGY_NAMES[mode]}** : {s['pct_win']}%")
+        lines.append(f"   {bar}")
+        lines.append(f"   ✅ {s['gagnes']} gagnés | ❌ {s['perdu']} perdus | Total {s['total']}")
+        lines.append("")
+
+    # Analyse détaillée
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🔬 **ANALYSE DÉTAILLÉE**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for mode in ranked:
+        lines += _mode_analyse_rich(mode, stats[mode])
+        lines.append("")
+
+    # Fréquence des costumes
+    if game_suit_log:
+        freq, total_games = _count_suit_freq(game_suit_log, start_g, end_g)
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "🃏 **FRÉQUENCE DES COSTUMES (Groupe Joueurs)**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        lines += _freq_comment(freq, total_games, start_g, end_g)
+        lines.append("")
+
+    # Évolution depuis le bilan précédent
+    if snapshots and len(snapshots) >= 2:
+        prev = snapshots[-2]['stats']
+        prev_ts = snapshots[-2]['ts'].strftime('%Hh%M')
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"📉 **ÉVOLUTION DEPUIS {prev_ts}**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for mode in MODES_ORDER:
+            name = STRATEGY_NAMES[mode]
+            diff = round(stats[mode]['pct_win'] - prev[mode]['pct_win'], 1)
+            if diff > 0:
+                lines.append(f"  ↗️ **{name}** : +{diff}% — en progression 📈")
+            elif diff < 0:
+                lines.append(f"  ↘️ **{name}** : {diff}% depuis {prev_ts} — baisse à surveiller ⚠️")
+            else:
+                lines.append(f"  ➡️ **{name}** : stable — taux inchangé")
+        lines.append("")
+
+    # Recommandation principale
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🎯 **RECOMMANDATION DE SOSSOU KOUAMÉ**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if stats[best]['total'] > 0:
+        lines.append(
+            f"✅ Sossou Kouamé préfère actuellement la stratégie **{best_name}** "
+            f"({stats[best]['pct_win']}% de réussite) — c'est la plus rentable à ce stade."
+        )
+    else:
+        lines.append("⚠️ Données insuffisantes pour une recommandation fiable.")
+
+    if stats[worst]['total'] > 0 and stats[worst]['pct_win'] < 45:
+        lines.append(
+            f"⚠️ Stratégie **{worst_name}** déconseillée pour l'instant "
+            f"({stats[worst]['pct_lose']}% de pertes — trop risquée)."
+        )
+
+    # Conseil stratégique "attendre 1 perdu"
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "💼 **CONSEIL STRATÉGIQUE IMPORTANT**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🛡️ Sossou Kouamé recommande fortement :",
+        "   _Attendez qu'une prédiction soit perdue (❌) avant de commencer_",
+        "   _à miser. Cela évite de démarrer sur deux pertes consécutives_",
+        "   _et protège votre bankroll dès le départ._",
+        "   👉 **Entrez sur la prédiction qui suit une perte — jamais avant.**",
+        "",
+    ]
+
+    # Proverbe et blague
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📖 **PROVERBE DU MOMENT**",
+        f"_{random.choice(_PROVERBES)}_",
+        "",
+        "😄 **CLINS D'ŒIL**",
+        random.choice(_BLAGUES),
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    return "\n".join(lines)
+
+
+def format_conseil_final_1440(stats: dict, snapshots: list, ecart_snaps: list) -> str:
+    """Conseil de fin de journée complet et riche envoyé au jeu #1440."""
+    ranked = sorted(
+        MODES_ORDER,
+        key=lambda m: (stats[m]['pct_win'], stats[m]['gagnes']),
+        reverse=True
+    )
+    best = ranked[0]
+    worst = ranked[-1]
+    best_name = STRATEGY_NAMES[best]
+    worst_name = STRATEGY_NAMES[worst]
+    medals = ["🥇", "🥈", "🥉"]
+
+    lines = [
+        "╔══════════════════════════════╗",
+        "║  🏁 FIN DE JOURNÉE — JEU #1440  ║",
+        "║   💡 RAPPORT SOSSOU KOUAMÉ    ║",
+        "╚══════════════════════════════╝",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🏆 **CLASSEMENT FINAL DES STRATÉGIES**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for i, mode in enumerate(ranked):
+        s = stats[mode]
+        bar_filled = int(s['pct_win'] / 10)
+        bar = "🟩" * bar_filled + "⬜" * (10 - bar_filled)
+        lines.append(f"{medals[i]} **{STRATEGY_NAMES[mode]}** : {s['pct_win']}% sur {s['total']} prédictions")
+        lines.append(f"   {bar}")
+        lines.append(f"   ✅0️⃣{s['r0']} | ✅1️⃣{s['r1']} | ✅2️⃣{s['r2']} | ✅3️⃣{s['r3']} | ❌{s['perdu']}")
+        lines.append("")
+
+    # Analyse détaillée
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🔬 **ANALYSE COMPLÈTE DU CYCLE**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for mode in ranked:
+        lines += _mode_analyse_rich(mode, stats[mode])
+        lines.append("")
+
+    # Fréquences des costumes sur tout le cycle
+    if game_suit_log:
+        start_g = min(game_suit_log.keys())
+        end_g = max(game_suit_log.keys())
+        freq, total_games = _count_suit_freq(game_suit_log, start_g, end_g)
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "🃏 **FRÉQUENCE DES COSTUMES — CYCLE COMPLET (Groupe Joueurs)**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        lines += _freq_comment(freq, total_games, start_g, end_g)
+        lines.append("")
+
+    # Évolution horodatée des stratégies
+    if snapshots and len(snapshots) >= 2:
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "📈 **ÉVOLUTION AU FIL DE LA JOURNÉE**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for mode in MODES_ORDER:
+            name = STRATEGY_NAMES[mode]
+            mode_snaps = [(s['ts'], s['stats'][mode]['pct_win'], s['game']) for s in snapshots]
+            lines.append(f"  🎯 **Stratégie {name}** :")
+            for i in range(len(mode_snaps)):
+                ts, win, gn = mode_snaps[i]
+                heure = ts.strftime('%Hh%M')
+                if i == 0:
+                    lines.append(f"    {heure} (jeu #{gn}) : départ à {win}%")
+                else:
+                    prev_win = mode_snaps[i - 1][1]
+                    prev_gn = mode_snaps[i - 1][2]
+                    diff = round(win - prev_win, 1)
+                    if diff > 0:
+                        lines.append(f"    {heure} (jeu #{gn}) : ↗️ +{diff}% → {win}% — en hausse")
+                    elif diff < 0:
+                        lines.append(f"    {heure} (jeu #{gn}) : ↘️ {diff}% → {win}% — baisse constatée")
+                    else:
+                        lines.append(f"    {heure} (jeu #{gn}) : ➡️ stable à {win}%")
+            lines.append("")
+
+    # Évolution des écarts max
+    if ecart_snaps and len(ecart_snaps) >= 1:
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "📊 **ÉVOLUTION DES ÉCARTS MAXIMAUX (Groupe Joueurs)**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for suit in ['♦', '♠', '♥', '♣']:
+            sname = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
+            ecart_vals = [
+                (s['ts'], s['max_ecarts_g1'].get(suit), s['game'])
+                for s in ecart_snaps
+                if s['max_ecarts_g1'].get(suit)
+            ]
+            if not ecart_vals:
+                lines.append(f"  {sname} : aucun écart significatif enregistré")
+                continue
+            lines.append(f"  {sname} :")
+            for i, (ts, mx, gn) in enumerate(ecart_vals):
+                heure = ts.strftime('%Hh%M')
+                val = mx['ecart']
+                span = f"#{mx['start']}→#{mx['end']}"
+                if i == 0:
+                    lines.append(f"    {heure} (jeu #{gn}) : écart max = {val} jeux {span}")
+                else:
+                    prev_val = ecart_vals[i - 1][1]['ecart']
+                    diff = val - prev_val
+                    if diff > 0:
+                        lines.append(f"    {heure} (jeu #{gn}) : ↗️ écart max monte à {val} jeux {span}")
+                    elif diff < 0:
+                        lines.append(f"    {heure} (jeu #{gn}) : ↘️ écart max redescend à {val} jeux {span}")
+                    else:
+                        lines.append(f"    {heure} (jeu #{gn}) : ➡️ écart max stable à {val} jeux {span}")
+        lines.append("")
+
+    # Recommandation finale
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🎯 **RECOMMANDATION FINALE DE SOSSOU KOUAMÉ**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if stats[best]['total'] > 0:
+        lines.append(
+            f"✅ Sur l'ensemble du cycle #1→#1440, la stratégie **{best_name}** "
+            f"s'impose avec {stats[best]['pct_win']}% de réussite sur {stats[best]['total']} prédictions."
+        )
+        lines.append(f"   👉 Sossou Kouamé recommande **{best_name}** pour le prochain cycle.")
+    if stats[worst]['total'] > 0 and stats[worst]['pct_win'] < 45:
+        lines.append(
+            f"⚠️ Stratégie **{worst_name}** : {stats[worst]['pct_lose']}% de pertes sur la journée. "
+            f"À éviter ou à utiliser avec des mises très prudentes."
+        )
+
+    # Conseil stratégique
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "💼 **CONSEIL STRATÉGIQUE IMPORTANT**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🛡️ Sossou Kouamé recommande fortement :",
+        "   _Attendez qu'une prédiction soit perdue (❌) avant de commencer_",
+        "   _à miser. Cela évite de démarrer sur deux pertes consécutives_",
+        "   _et protège votre bankroll dès le départ._",
+        "   👉 **Entrez sur la prédiction qui suit une perte — jamais avant.**",
+        "",
+    ]
+
+    # Proverbe et blague de fin
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "📖 **SAGESSE DU SOIR**",
+        f"_{random.choice(_PROVERBES)}_",
+        "",
+        "😄 **MOT DE LA FIN**",
+        random.choice(_BLAGUES),
+        "",
+        "_Analyse réalisée sur le cycle complet #1 → #1440 — Baccarat AI 🤖_",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    return "\n".join(lines)
+
+
+async def _save_ecart_snapshot(game: int):
+    """Sauvegarde un snapshot des écarts maximaux courants."""
+    try:
+        max_g1 = get_max_ecart(compute_ecarts(game, suit_log=game_suit_log))
+        max_g3 = get_max_ecart(compute_ecarts(game, suit_log=game_suit_log3))
+        ecart_snapshots.append({
+            'ts': datetime.now(),
+            'game': game,
+            'max_ecarts_g1': {suit: v for suit, v in max_g1.items() if v},
+            'max_ecarts_g3': {suit: v for suit, v in max_g3.items() if v},
+        })
+    except Exception as e:
+        logger.error(f"❌ Erreur snapshot écart: {e}")
+
+
+async def send_bilan_to_all(is_final: bool = False):
+    """Envoie le bilan + conseil à l'admin et au canal de prédiction.
+    is_final=True → conseil de fin de journée #1440.
+    """
+    global _last_auto_bilan_time
+    now = datetime.now()
+    now_str = now.strftime('%d/%m/%Y %H:%M')
+    game = current_game_number
+
+    stats = compute_bilan_by_mode(prediction_history)
+
+    # Sauvegarder le snapshot courant
+    bilan_snapshots.append({'ts': now, 'game': game, 'stats': stats})
+
+    bilan_msg = format_bilan_message(stats, now_str, game)
+
+    if is_final:
+        conseil_msg = format_conseil_final_1440(stats, bilan_snapshots, ecart_snapshots)
+    else:
+        conseil_msg = format_conseil_message(stats, bilan_snapshots)
+
+    _last_auto_bilan_time = now
+
+    async def _send_two(entity):
+        await client.send_message(entity, bilan_msg, parse_mode='markdown')
+        await asyncio.sleep(1)
+        await client.send_message(entity, conseil_msg, parse_mode='markdown')
+
+    if ADMIN_ID and ADMIN_ID != 0:
+        try:
+            admin_entity = await client.get_input_entity(ADMIN_ID)
+            await _send_two(admin_entity)
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi bilan admin: {e}")
+
+    if PREDICTION_CHANNEL_ID:
+        try:
+            pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
+            if pred_entity:
+                await _send_two(pred_entity)
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi bilan canal: {e}")
+
+    logger.info(f"📊 Bilan {'final #1440' if is_final else 'intermédiaire'} envoyé")
+
+
+async def auto_bilan_task():
+    """Tâche de fond : envoie le bilan toutes les BILAN_INTERVAL_MINUTES minutes."""
+    global BILAN_INTERVAL_MINUTES
+    while True:
+        await asyncio.sleep(BILAN_INTERVAL_MINUTES * 60)
+        try:
+            await _save_ecart_snapshot(current_game_number)
+            await send_bilan_to_all(is_final=False)
+        except Exception as e:
+            logger.error(f"❌ Erreur auto_bilan_task: {e}")
+
+
+async def cmd_bilan(event):
+    """Commande /bilan — envoie le bilan immédiat des 3 modes."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        await _save_ecart_snapshot(current_game_number)
+        await send_bilan_to_all(is_final=False)
+        await event.respond("✅ Bilan envoyé !")
+    except Exception as e:
+        logger.error(f"Erreur cmd_bilan: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+async def cmd_bilaninterval(event):
+    """Commande /bilaninterval [minutes] — définit l'intervalle d'envoi automatique du bilan."""
+    global BILAN_INTERVAL_MINUTES
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        parts = event.raw_text.strip().split()
+        if len(parts) < 2:
+            await event.respond(
+                f"⏱ Intervalle actuel : **{BILAN_INTERVAL_MINUTES} min**\n"
+                f"Usage : `/bilaninterval [minutes]` (min. 5)"
+            )
+            return
+        val = int(parts[1])
+        if val < 5:
+            await event.respond("❌ L'intervalle minimum est de 5 minutes.")
+            return
+        old = BILAN_INTERVAL_MINUTES
+        BILAN_INTERVAL_MINUTES = val
+        await event.respond(
+            f"✅ Intervalle bilan : **{old} min → {BILAN_INTERVAL_MINUTES} min**\n"
+            f"_(Le prochain bilan sera envoyé dans {BILAN_INTERVAL_MINUTES} min)_"
+        )
+        logger.info(f"⏱ Intervalle bilan modifié : {old} → {BILAN_INTERVAL_MINUTES} min")
+    except ValueError:
+        await event.respond("❌ Valeur invalide. Usage : `/bilaninterval [minutes]`")
+    except Exception as e:
+        logger.error(f"Erreur cmd_bilaninterval: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+# ============================================================================
 # SETUP ET DÉMARRAGE
 # ============================================================================
 
@@ -2897,6 +3517,10 @@ def setup_handlers():
 
     # Mode de prédiction
     client.add_event_handler(cmd_modepredict, events.NewMessage(pattern=r'^/modepredict'))
+
+    # Bilan
+    client.add_event_handler(cmd_bilan, events.NewMessage(pattern=r'^/bilan$'))
+    client.add_event_handler(cmd_bilaninterval, events.NewMessage(pattern=r'^/bilaninterval'))
 
     # Gestion
     client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
@@ -2944,6 +3568,7 @@ async def main():
             return
         
         asyncio.create_task(auto_reset_system())
+        asyncio.create_task(auto_bilan_task())
         
         app = web.Application()
         app.router.add_get('/health', lambda r: web.Response(text="OK"))
