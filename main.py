@@ -593,41 +593,32 @@ async def generate_and_send_ecarts_pdf(recipient, ecarts_by_suit: Dict[str, List
         f"Généré le {now_str}"
     )
     file_tag = "banquier" if "Banquier" in title else "joueurs"
+    filename = f"ecarts_costumes_{file_tag}_{max_game}.pdf"
+    buf.name = filename
     await client.send_file(
         recipient,
         buf,
         caption=caption,
-        file_name=f"ecarts_costumes_{file_tag}_{max_game}.pdf",
+        file_name=filename,
         force_document=True,
         mime_type='application/pdf'
     )
 
 
 async def _send_ecarts_auto(game_number: int):
-    """Envoie les rapports d'écarts (Joueurs + Banquier) automatiquement."""
+    """Envoie les PDFs d'écarts (Joueurs + Banquier) à l'admin en privé."""
     try:
         max_g = game_number
         ecarts1 = compute_ecarts(max_g, suit_log=game_suit_log)
         ecarts3 = compute_ecarts(max_g, suit_log=game_suit_log3)
-        logger.info(f"📊 Rapports écarts auto générés pour #{max_g}")
+        logger.info(f"📊 Calcul écarts auto terminé pour #{max_g}")
 
         if ADMIN_ID and ADMIN_ID != 0:
             admin_entity = await client.get_input_entity(ADMIN_ID)
             await generate_and_send_ecarts_pdf(admin_entity, ecarts1, max_g, title="Joueurs.....")
+            await asyncio.sleep(1)
             await generate_and_send_ecarts_pdf(admin_entity, ecarts3, max_g, title="Banquier")
-            logger.info(f"✅ PDFs écarts envoyés à l'admin")
-
-        if PREDICTION_CHANNEL_ID:
-            pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-            if pred_entity:
-                await generate_and_send_ecarts_pdf(pred_entity, ecarts1, max_g, title="Joueurs.....")
-                await generate_and_send_ecarts_pdf(pred_entity, ecarts3, max_g, title="Banquier")
-                logger.info(f"✅ PDFs écarts envoyés au canal prédictions")
-
-        # Snapshot écarts + bilan final de fin de journée au jeu #1440
-        await _save_ecart_snapshot(max_g)
-        await send_bilan_to_all(is_final=True)
-        logger.info(f"📊 Bilan final #1440 envoyé")
+            logger.info(f"✅ PDFs écarts (Joueurs + Banquier) envoyés à l'admin")
     except Exception as e:
         logger.error(f"❌ Erreur envoi écarts auto: {e}")
 
@@ -1318,7 +1309,16 @@ async def process_game_result(game_number: int, message_text: str):
     # Reset auto à #1440 (après avoir enregistré le jeu 1440 dans game_suit_log)
     if current_game_number >= 1440:
         logger.warning(f"🚨 RESET #1440 atteint")
+        # 1. Snapshot écarts final
+        await _save_ecart_snapshot(game_number)
+        # 2. Bilan final + conseil complet de fin de journée (privé admin)
+        try:
+            await send_bilan_to_all(is_final=True)
+        except Exception as e:
+            logger.error(f"❌ Erreur bilan final #1440: {e}")
+        # 3. PDF écarts joueurs + banquier
         await _send_ecarts_auto(game_number)
+        # 4. Reset complet (envoie aussi le PDF des prédictions)
         await perform_full_reset("🚨 Reset automatique - Numéro #1440 atteint", is_1440_reset=True)
         return
     
@@ -2303,11 +2303,13 @@ async def _generate_and_send_pdf(get_sender_fn, preds, header_lines, total, nb_g
     if len(caption) > 1000:
         caption = caption[:1000] + "..."
 
+    pdf_filename = "predictions_baccarat.pdf"
+    buf.name = pdf_filename
     await client.send_file(
         sender,
         buf,
         caption=caption,
-        file_name="predictions_baccarat.pdf",
+        file_name=pdf_filename,
         force_document=True,
         mime_type='application/pdf'
     )
@@ -2475,6 +2477,12 @@ async def cmd_help(event):
 `/ecarts3` - Rapport + PDF des écarts 2ème groupe (Banquier)
 `/ecarts3 [N]` - Limiter au jeu N (ex: /ecarts3 720)
 
+**📊 Bilan & Conseils:**
+`/bilan` - Bilan immédiat (envoyé en privé)
+`/bilaninterval [min]` - Intervalle auto-bilan (actuel: {BILAN_INTERVAL_MINUTES} min)
+`/addproverbe [texte]` - Ajouter un proverbe (sans arg = liste actuelle)
+`/addblague [texte]` - Ajouter une blague (sans arg = liste actuelle)
+
 **📋 Gestion:**
 `/informations` - Liste complète des prédictions (PDF si trop long)
 `/pending` - Prédictions en cours de vérification
@@ -2488,6 +2496,10 @@ async def cmd_help(event):
 • C3 seul ≥ B → manquant(C3) au numéro source+Z
 • C2+C3 inverses → costume C2 au numéro source+F
 → La prédiction est lancée **immédiatement** au jeu de détection
+
+💡 **À #1440 (reset auto) :**
+→ Bilan final + PDF prédictions + PDF écarts envoyés en privé avant reset
+→ Paramètres (seuils, canaux, intervalle) conservés après reset
 
 🤖 Baccarat AI | By Sossou Kouamé"""
 
@@ -2959,7 +2971,7 @@ def format_bilan_message(stats: dict, now_str: str, game: int = 0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ressources textuelles pour les conseils
+# Ressources textuelles pour les conseils (extensibles via commandes)
 # ---------------------------------------------------------------------------
 _PROVERBES = [
     "« La patience est la mère de toutes les vertus. » — Proverbe africain",
@@ -2970,15 +2982,70 @@ _PROVERBES = [
     "« L'eau qui coule doucement creuse la pierre. » — Proverbe africain",
     "« Mieux vaut une petite victoire certaine qu'une grande victoire douteuse. »",
     "« Connais ton ennemi et connais-toi toi-même. » — Sun Tzu",
+    "« Le succès, c'est d'aller d'échec en échec sans perdre son enthousiasme. » — Winston Churchill",
+    "« Qui observe le vent ne sèmera pas ; qui regarde les nuages ne moissonnera pas. » — Ecclésiaste",
+    "« La chance sourit aux audacieux qui savent attendre. » — Sagesse du joueur",
+    "« Chaque défaite est une leçon déguisée. » — Proverbe universel",
 ]
 _BLAGUES = [
     "😄 Le baccarat, c'est comme la vie : parfois tu gagnes, parfois tu apprends !",
     "😂 Pourquoi le joueur sage attend-il ? Parce que les billets n'aiment pas être pressés !",
     "🤣 Sossou Kouamé dit : 'Si la stratégie Cobra te mord, c'est que tu n'as pas attendu l'écart !'",
     "😆 La différence entre un bon joueur et un mauvais ? Le bon joue les données, le mauvais joue les émotions !",
-    "😁 Rappel du jour : le bot prédit, mais c'est toi qui décides de miser ou pas. Sage decision = portefeuille en bonne santé 💰",
+    "😁 Rappel du jour : le bot prédit, mais c'est toi qui décides de miser ou pas. Sage décision = portefeuille en bonne santé 💰",
     "😂 Sossou Kouamé a dit un jour : 'J'ai perdu une fois en ne suivant pas les données. Je n'ai pas recommencé !'",
+    "🎯 Un joueur demande à son ami : 'Comment tu fais pour gagner ?' — 'Je lis les écarts et j'attends.' — 'C'est tout ?' — 'C'est tout.'",
+    "😄 La martingale parfaite : attendre que le bot détecte l'écart avant de miser. Révolutionnaire !",
+    "😂 Mon banquier m'a dit de diversifier mes investissements. J'ai commencé par apprendre les 4 costumes.",
+    "🤣 Compteur2 à 4, Compteur3 à 3, portefeuille à l'aise — voilà la sainte trinité selon Sossou Kouamé !",
 ]
+
+# Rotation sans répétition pour proverbes et blagues
+_proverbes_queue: list = []   # indices restants à utiliser
+_blagues_queue: list = []     # indices restants à utiliser
+_conseil_alternance: int = 0  # 0 = proverbe ce bilan, 1 = blague ce bilan
+
+
+def _pick_proverbe() -> str:
+    """Pioche un proverbe sans répéter jusqu'à épuisement, puis recommence."""
+    global _proverbes_queue
+    if not _proverbes_queue:
+        _proverbes_queue = list(range(len(_PROVERBES)))
+        random.shuffle(_proverbes_queue)
+    idx = _proverbes_queue.pop(0)
+    return _PROVERBES[idx]
+
+
+def _pick_blague() -> str:
+    """Pioche une blague sans répéter jusqu'à épuisement, puis recommence."""
+    global _blagues_queue
+    if not _blagues_queue:
+        _blagues_queue = list(range(len(_BLAGUES)))
+        random.shuffle(_blagues_queue)
+    idx = _blagues_queue.pop(0)
+    return _BLAGUES[idx]
+
+
+def _pick_conseil_content() -> list:
+    """Retourne le bloc de fin de conseil en alternant proverbe/blague à chaque envoi."""
+    global _conseil_alternance
+    if _conseil_alternance == 0:
+        content = [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "📖 **PROVERBE DU MOMENT**",
+            f"_{_pick_proverbe()}_",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        _conseil_alternance = 1
+    else:
+        content = [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "😄 **CLIN D'ŒIL DE SOSSOU**",
+            _pick_blague(),
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        _conseil_alternance = 0
+    return content
 _SUIT_DISPLAY_CONSEIL = {
     '♠': '♠️ Pique',
     '♥': '❤️ Cœur',
@@ -3003,41 +3070,238 @@ def _count_suit_freq(suit_log: dict, start_g: int, end_g: int) -> dict:
 
 
 def _freq_comment(freq: dict, total_games: int, start_g: int, end_g: int) -> list:
-    """Génère le bloc d'analyse des fréquences de costumes."""
+    """Génère le bloc d'analyse des fréquences de costumes avec conseil par costume."""
     if total_games == 0:
         return ["  Aucune donnée de jeu disponible pour cette période."]
-    lines = [f"  Analyse des costumes du jeu #{start_g} au jeu #{end_g} ({total_games} jeux) :"]
+
+    lines = [f"  Jeu #{start_g} → #{end_g} — {total_games} jeux analysés :"]
+    lines.append("")
+
     sorted_suits = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    max_count = sorted_suits[0][1]   # valeur la plus haute (1er dans le tri décroissant)
-    min_count = sorted_suits[-1][1]  # valeur la plus basse (dernier dans le tri décroissant)
+    max_count = sorted_suits[0][1]
+    min_count = sorted_suits[-1][1]
     all_equal = (max_count == min_count)
+
+    # Tableau des apparitions avec barre visuelle
+    lines.append("  📋 Nombre d'apparitions :")
     for rank, (suit, count) in enumerate(sorted_suits):
         name = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
         pct = round(count / total_games * 100, 1) if total_games > 0 else 0
-        bar = "█" * min(int(pct / 5), 20)
+        bar_filled = min(int(pct / 5), 20)
+        bar = "🟦" * bar_filled + "⬜" * (20 - bar_filled)
         if all_equal:
-            comment = "fréquence équilibrée"
+            badge = "⚖️"
         elif rank == 0:
-            comment = "⬆️ costume dominant"
+            badge = "🔺"
         elif rank == len(sorted_suits) - 1:
-            comment = "⬇️ costume le plus rare — surveiller les écarts !"
+            badge = "🔻"
         elif pct >= 25:
-            comment = "fréquence normale"
+            badge = "✅"
         else:
-            comment = "légèrement en retrait"
-        lines.append(f"  {name} : {count}× ({pct}%) {bar} — {comment}")
+            badge = "⚠️"
+        lines.append(f"  {badge} {name} : **{count} apparitions** ({pct}%)")
+        lines.append(f"     {bar}")
+
+    lines.append("")
+
+    # Conseil individuel par costume (du plus rare au plus fréquent = du plus intéressant)
+    sorted_asc = sorted(freq.items(), key=lambda x: x[1])  # du plus rare au plus fréquent
+    lines.append("  🎯 Conseil par costume :")
+    for rank_asc, (suit, count) in enumerate(sorted_asc):
+        name = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
+        pct = round(count / total_games * 100, 1) if total_games > 0 else 0
+        manque = total_games - count  # nombre de jeux sans ce costume (approx)
+        if all_equal:
+            conseil = f"Fréquences équilibrées — aucun avantage particulier sur {name}."
+        elif rank_asc == 0:
+            gap = round((max_count - count) / total_games * 100, 1)
+            conseil = (
+                f"🚨 **{name}** : SOUS-REPRÉSENTÉ avec seulement {count} apparitions ({pct}%). "
+                f"Écart de {gap}% avec le dominant. "
+                f"→ **Ce costume est le plus susceptible de revenir — surveillez-le en priorité.**"
+            )
+        elif rank_asc == 1:
+            conseil = (
+                f"⚠️ **{name}** : En retrait ({count} apparitions, {pct}%). "
+                f"→ Gardez-le dans votre radar, il peut rapidement rattraper son retard."
+            )
+        elif rank_asc == len(sorted_asc) - 2:
+            conseil = (
+                f"📊 **{name}** : Fréquence correcte ({count} apparitions, {pct}%). "
+                f"→ Pas de signal particulier — misez selon vos stratégies habituelles."
+            )
+        else:
+            conseil = (
+                f"🔺 **{name}** : DOMINANT avec {count} apparitions ({pct}%). "
+                f"→ Statistiquement sur-représenté — il peut ralentir. Moins prioritaire."
+            )
+        lines.append(f"  • {conseil}")
+
+    lines.append("")
+
+    # Résumé global
     if not all_equal:
-        dominant_suit, dominant_count = sorted_suits[0]
         rarest_suit, rarest_count = sorted_suits[-1]
-        dominant_name = _SUIT_DISPLAY_CONSEIL.get(dominant_suit, dominant_suit)
+        dominant_suit, dominant_count = sorted_suits[0]
         rarest_name = _SUIT_DISPLAY_CONSEIL.get(rarest_suit, rarest_suit)
-        lines += [
-            "",
-            f"  🔍 Costume dominant : **{dominant_name}** ({dominant_count}×) — présent très fréquemment.",
-            f"  🔍 Costume rare     : **{rarest_name}** ({rarest_count}×) — risque d'écart important en cours ou à venir.",
-        ]
+        dominant_name = _SUIT_DISPLAY_CONSEIL.get(dominant_suit, dominant_suit)
+        gap_pct = round((dominant_count - rarest_count) / total_games * 100, 1)
+        lines.append(f"  📌 **Résumé** : {rarest_name} est le plus rare ({rarest_count}×) vs")
+        lines.append(f"     {dominant_name} le plus fréquent ({dominant_count}×) — écart global : {gap_pct}%.")
+        if gap_pct >= 5:
+            lines.append(f"  ⚡ Écart statistique significatif ({gap_pct}%) — déséquilibre à exploiter !")
+        else:
+            lines.append(f"  ✅ Jeu relativement équilibré ({gap_pct}% d'écart) — continuez votre stratégie.")
     else:
-        lines += ["", "  🔍 Fréquences équilibrées entre tous les costumes — aucun écart structurel détecté."]
+        lines.append("  ✅ Tous les costumes apparaissent de manière équilibrée — aucun déséquilibre détecté.")
+
+    return lines
+
+
+def _analyse_manques_courants() -> list:
+    """Analyse les manques en cours via les trackers C2 et C3.
+    Retourne un bloc de lignes pour le conseil, alertant sur les absences longues.
+    """
+    lines = []
+    warnings = []
+    infos = []
+    suit_order = ['♦', '♠', '♥', '♣']
+
+    for suit in suit_order:
+        name = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
+        tc2 = compteur2_trackers.get(suit)
+        tc3 = compteur3_trackers.get(suit)
+        c2 = tc2.counter if tc2 else 0
+        c3 = tc3.counter if tc3 else 0
+        c2_start = tc2.streak_start_game if tc2 and tc2.streak_start_game > 0 else None
+        c3_start = tc3.streak_start_game if tc3 and tc3.streak_start_game > 0 else None
+
+        parts = []
+        if c2 > 0:
+            since_str = f" depuis #{c2_start}" if c2_start else ""
+            level = "🔴" if c2 >= compteur2_seuil_B else ("🟡" if c2 >= max(1, compteur2_seuil_B - 1) else "🟢")
+            parts.append(f"C2={c2}/{compteur2_seuil_B}{since_str} {level}")
+        if c3 > 0:
+            since_str = f" depuis #{c3_start}" if c3_start else ""
+            level = "🔴" if c3 >= compteur3_seuil_B2 else ("🟡" if c3 >= max(1, compteur3_seuil_B2 - 1) else "🟢")
+            parts.append(f"C3={c3}/{compteur3_seuil_B2}{since_str} {level}")
+
+        if parts:
+            line = f"  {name} : {' | '.join(parts)}"
+            if (tc2 and c2 >= compteur2_seuil_B) or (tc3 and c3 >= compteur3_seuil_B2):
+                warnings.append(f"🚨 {line.strip()} — **seuil atteint, prédiction possible !**")
+            elif (tc2 and c2 >= max(1, compteur2_seuil_B - 1)) or (tc3 and c3 >= max(1, compteur3_seuil_B2 - 1)):
+                warnings.append(f"⚠️ {line.strip()} — proche du seuil")
+            else:
+                infos.append(f"  {name} : {' | '.join(parts)}")
+
+    if not warnings and not infos:
+        lines.append("  ✅ Aucun manque significatif en cours — tous les costumes apparaissent régulièrement.")
+    else:
+        if warnings:
+            for w in warnings:
+                lines.append(w)
+        if infos:
+            for inf in infos:
+                lines.append(inf)
+
+    # Ajouter l'état des suits sans manque
+    suits_ok = []
+    for suit in suit_order:
+        tc2 = compteur2_trackers.get(suit)
+        tc3 = compteur3_trackers.get(suit)
+        if (not tc2 or tc2.counter == 0) and (not tc3 or tc3.counter == 0):
+            suits_ok.append(_SUIT_DISPLAY_CONSEIL.get(suit, suit))
+    if suits_ok:
+        lines.append(f"  ✅ Présents régulièrement : {', '.join(suits_ok)}")
+
+    return lines
+
+
+def _analyse_ecarts_variation(ecart_snaps: list) -> list:
+    """Compare les écarts maximaux actuels avec les snapshots précédents.
+    Retourne un bloc d'analyse montrant si les écarts montent, descendent ou stagnent.
+    """
+    if not ecart_snaps or len(ecart_snaps) < 2:
+        if ecart_snaps and len(ecart_snaps) == 1:
+            snap = ecart_snaps[0]
+            lines = [f"  _(Premier snapshot à {snap['ts'].strftime('%Hh%M')}, jeu #{snap['game']})_"]
+            for suit in ['♦', '♠', '♥', '♣']:
+                name = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
+                mx = snap['max_ecarts_g1'].get(suit)
+                if mx:
+                    lines.append(f"  {name} : écart max = {mx['ecart']} jeux [#{mx['start']}→#{mx['end']}]")
+                else:
+                    lines.append(f"  {name} : aucun écart significatif")
+            return lines
+        return ["  Données insuffisantes (au moins 2 bilans nécessaires pour la comparaison)."]
+
+    prev = ecart_snaps[-2]
+    curr = ecart_snaps[-1]
+    prev_ts = prev['ts'].strftime('%Hh%M')
+    curr_ts = curr['ts'].strftime('%Hh%M')
+    lines = [f"  Comparaison {prev_ts} → {curr_ts} (jeu #{prev['game']} → #{curr['game']}) :"]
+
+    for suit in ['♦', '♠', '♥', '♣']:
+        name = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
+        prev_mx = prev['max_ecarts_g1'].get(suit)
+        curr_mx = curr['max_ecarts_g1'].get(suit)
+
+        if not curr_mx and not prev_mx:
+            lines.append(f"  {name} : aucun écart — costume très régulier ✅")
+            continue
+        if not curr_mx:
+            lines.append(f"  {name} : écart résorbé — costume revenu ✅")
+            continue
+        if not prev_mx:
+            lines.append(f"  {name} : nouvel écart détecté ! max={curr_mx['ecart']} jeux [#{curr_mx['start']}→#{curr_mx['end']}] 🆕")
+            continue
+
+        diff = curr_mx['ecart'] - prev_mx['ecart']
+        span = f"[#{curr_mx['start']}→#{curr_mx['end']}]"
+        if diff > 0:
+            lines.append(f"  {name} : ↗️ écart max +{diff} → {curr_mx['ecart']} jeux {span} — **absence qui s'allonge** ⚠️")
+        elif diff < 0:
+            lines.append(f"  {name} : ↘️ écart max {diff} → {curr_mx['ecart']} jeux {span} — costume qui revient ✅")
+        else:
+            lines.append(f"  {name} : ➡️ écart stable à {curr_mx['ecart']} jeux {span}")
+
+    return lines
+
+
+def _analyse_freq_variation(freq_curr: dict, total_curr: int, prev_snap: dict) -> list:
+    """Compare les fréquences actuelles avec le snapshot précédent pour détecter les dérives."""
+    if not prev_snap:
+        return []
+
+    prev_stats = prev_snap.get('stats')
+    if not prev_stats:
+        return []
+
+    lines = [f"  Variation depuis le bilan de {prev_snap['ts'].strftime('%Hh%M')} :"]
+    has_variation = False
+
+    for suit in ['♦', '♠', '♥', '♣']:
+        name = _SUIT_DISPLAY_CONSEIL.get(suit, suit)
+        curr_pct = round(freq_curr.get(suit, 0) / total_curr * 100, 1) if total_curr > 0 else 0
+        # On ne peut pas comparer directement les fréquences entre snapshots car les snapshots
+        # ne stockent pas les fréquences — on utilise les pct_win comme proxy de tendance
+        # La vraie variation de fréquence est basée sur la fenêtre récente vs globale
+        if total_curr >= 50:
+            last_50_start = max(1, current_game_number - 49)
+            freq_last50, total_last50 = _count_suit_freq(game_suit_log, last_50_start, current_game_number)
+            recent_pct = round(freq_last50.get(suit, 0) / total_last50 * 100, 1) if total_last50 > 0 else 0
+            diff = round(recent_pct - curr_pct, 1)
+            if abs(diff) >= 3:
+                has_variation = True
+                if diff > 0:
+                    lines.append(f"  {name} : ↗️ +{diff}% récemment ({recent_pct}% sur 50 derniers jeux vs {curr_pct}% global)")
+                else:
+                    lines.append(f"  {name} : ↘️ {diff}% récemment ({recent_pct}% sur 50 derniers jeux vs {curr_pct}% global) — surveiller !")
+
+    if not has_variation:
+        lines.append("  ➡️ Fréquences stables — aucune dérive significative détectée sur les 50 derniers jeux.")
+
     return lines
 
 
@@ -3074,8 +3338,8 @@ def _mode_analyse_rich(mode: str, s: dict) -> list:
     return lines
 
 
-def format_conseil_message(stats: dict, snapshots: list = None) -> str:
-    """Conseil intermédiaire riche, visuellement attrayant, avec fréquences + proverbe + blague."""
+def format_conseil_message(stats: dict, snapshots: list = None, ecart_snaps: list = None) -> str:
+    """Conseil intermédiaire riche avec fréquences, manques, variation d'écarts + proverbe/blague."""
     ranked = sorted(
         MODES_ORDER,
         key=lambda m: (stats[m]['pct_win'], stats[m]['gagnes']),
@@ -3086,7 +3350,6 @@ def format_conseil_message(stats: dict, snapshots: list = None) -> str:
     best_name = STRATEGY_NAMES[best]
     worst_name = STRATEGY_NAMES[worst]
 
-    # En-tête
     now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
     start_g = min(game_suit_log.keys()) if game_suit_log else 1
     end_g = current_game_number if current_game_number > 0 else (max(game_suit_log.keys()) if game_suit_log else 1)
@@ -3111,7 +3374,7 @@ def format_conseil_message(stats: dict, snapshots: list = None) -> str:
         lines.append(f"   ✅ {s['gagnes']} gagnés | ❌ {s['perdu']} perdus | Total {s['total']}")
         lines.append("")
 
-    # Analyse détaillée
+    # Analyse détaillée par stratégie
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "🔬 **ANALYSE DÉTAILLÉE**",
@@ -3121,7 +3384,36 @@ def format_conseil_message(stats: dict, snapshots: list = None) -> str:
         lines += _mode_analyse_rich(mode, stats[mode])
         lines.append("")
 
-    # Fréquence des costumes
+    # Évolution des taux depuis le bilan précédent
+    if snapshots and len(snapshots) >= 2:
+        prev = snapshots[-2]['stats']
+        prev_ts = snapshots[-2]['ts'].strftime('%Hh%M')
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"📉 **ÉVOLUTION DES STRATÉGIES DEPUIS {prev_ts}**",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for mode in MODES_ORDER:
+            name = STRATEGY_NAMES[mode]
+            diff = round(stats[mode]['pct_win'] - prev[mode]['pct_win'], 1)
+            if diff > 0:
+                lines.append(f"  ↗️ **{name}** : +{diff}% — en progression 📈")
+            elif diff < 0:
+                lines.append(f"  ↘️ **{name}** : {diff}% — baisse à surveiller ⚠️")
+            else:
+                lines.append(f"  ➡️ **{name}** : stable — taux inchangé")
+        lines.append("")
+
+    # Manques en cours (trackers C2 / C3 en temps réel)
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "⏳ **MANQUES EN COURS (C2 / C3)**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    lines += _analyse_manques_courants()
+    lines.append("")
+
+    # Fréquence des costumes + variation récente
     if game_suit_log:
         freq, total_games = _count_suit_freq(game_suit_log, start_g, end_g)
         lines += [
@@ -3131,25 +3423,22 @@ def format_conseil_message(stats: dict, snapshots: list = None) -> str:
         ]
         lines += _freq_comment(freq, total_games, start_g, end_g)
         lines.append("")
+        # Variation récente (50 derniers jeux vs global)
+        if total_games >= 50 and snapshots and len(snapshots) >= 1:
+            lines += [
+                "  📊 _Dérive récente (50 derniers jeux vs global) :_",
+            ]
+            lines += _analyse_freq_variation(freq, total_games, snapshots[-1] if len(snapshots) >= 1 else None)
+            lines.append("")
 
-    # Évolution depuis le bilan précédent
-    if snapshots and len(snapshots) >= 2:
-        prev = snapshots[-2]['stats']
-        prev_ts = snapshots[-2]['ts'].strftime('%Hh%M')
+    # Variation des écarts historiques (snapshots)
+    if ecart_snaps:
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"📉 **ÉVOLUTION DEPUIS {prev_ts}**",
+            "📊 **VARIATION DES ÉCARTS (MANQUES HISTORIQUES)**",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
         ]
-        for mode in MODES_ORDER:
-            name = STRATEGY_NAMES[mode]
-            diff = round(stats[mode]['pct_win'] - prev[mode]['pct_win'], 1)
-            if diff > 0:
-                lines.append(f"  ↗️ **{name}** : +{diff}% — en progression 📈")
-            elif diff < 0:
-                lines.append(f"  ↘️ **{name}** : {diff}% depuis {prev_ts} — baisse à surveiller ⚠️")
-            else:
-                lines.append(f"  ➡️ **{name}** : stable — taux inchangé")
+        lines += _analyse_ecarts_variation(ecart_snaps)
         lines.append("")
 
     # Recommandation principale
@@ -3186,16 +3475,8 @@ def format_conseil_message(stats: dict, snapshots: list = None) -> str:
         "",
     ]
 
-    # Proverbe et blague
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "📖 **PROVERBE DU MOMENT**",
-        f"_{random.choice(_PROVERBES)}_",
-        "",
-        "😄 **CLINS D'ŒIL**",
-        random.choice(_BLAGUES),
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
+    # Proverbe ou blague (alternance)
+    lines += _pick_conseil_content()
 
     return "\n".join(lines)
 
@@ -3350,14 +3631,14 @@ def format_conseil_final_1440(stats: dict, snapshots: list, ecart_snaps: list) -
         "",
     ]
 
-    # Proverbe et blague de fin
+    # Fin de cycle : proverbe ET blague (rapport complet de fin de journée)
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "📖 **SAGESSE DU SOIR**",
-        f"_{random.choice(_PROVERBES)}_",
+        f"_{_pick_proverbe()}_",
         "",
         "😄 **MOT DE LA FIN**",
-        random.choice(_BLAGUES),
+        _pick_blague(),
         "",
         "_Analyse réalisée sur le cycle complet #1 → #1440 — Baccarat AI 🤖_",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -3382,7 +3663,7 @@ async def _save_ecart_snapshot(game: int):
 
 
 async def send_bilan_to_all(is_final: bool = False):
-    """Envoie le bilan + conseil à l'admin et au canal de prédiction.
+    """Envoie le bilan + conseil uniquement en chat privé à l'admin.
     is_final=True → conseil de fin de journée #1440.
     """
     global _last_auto_bilan_time
@@ -3400,41 +3681,40 @@ async def send_bilan_to_all(is_final: bool = False):
     if is_final:
         conseil_msg = format_conseil_final_1440(stats, bilan_snapshots, ecart_snapshots)
     else:
-        conseil_msg = format_conseil_message(stats, bilan_snapshots)
+        conseil_msg = format_conseil_message(stats, bilan_snapshots, ecart_snapshots)
 
     _last_auto_bilan_time = now
 
-    async def _send_two(entity):
-        await client.send_message(entity, bilan_msg, parse_mode='markdown')
-        await asyncio.sleep(1)
-        await client.send_message(entity, conseil_msg, parse_mode='markdown')
-
+    # Envoi uniquement en chat privé à l'admin (pas dans le canal)
     if ADMIN_ID and ADMIN_ID != 0:
         try:
             admin_entity = await client.get_input_entity(ADMIN_ID)
-            await _send_two(admin_entity)
+            await client.send_message(admin_entity, bilan_msg, parse_mode='markdown')
+            await asyncio.sleep(1)
+            await client.send_message(admin_entity, conseil_msg, parse_mode='markdown')
         except Exception as e:
             logger.error(f"❌ Erreur envoi bilan admin: {e}")
 
-    if PREDICTION_CHANNEL_ID:
-        try:
-            pred_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-            if pred_entity:
-                await _send_two(pred_entity)
-        except Exception as e:
-            logger.error(f"❌ Erreur envoi bilan canal: {e}")
-
-    logger.info(f"📊 Bilan {'final #1440' if is_final else 'intermédiaire'} envoyé")
+    logger.info(f"📊 Bilan {'final #1440' if is_final else 'intermédiaire'} envoyé en privé à l'admin")
 
 
 async def auto_bilan_task():
-    """Tâche de fond : envoie le bilan toutes les BILAN_INTERVAL_MINUTES minutes."""
-    global BILAN_INTERVAL_MINUTES
+    """Tâche de fond : envoie le bilan toutes les BILAN_INTERVAL_MINUTES minutes.
+    Utilise des cycles courts (30s) pour que le changement d'intervalle soit immédiatement pris en compte.
+    """
+    global BILAN_INTERVAL_MINUTES, _last_auto_bilan_time
+    _last_auto_bilan_time = datetime.now()
     while True:
-        await asyncio.sleep(BILAN_INTERVAL_MINUTES * 60)
+        await asyncio.sleep(30)
         try:
-            await _save_ecart_snapshot(current_game_number)
-            await send_bilan_to_all(is_final=False)
+            now = datetime.now()
+            if _last_auto_bilan_time is None:
+                _last_auto_bilan_time = now
+                continue
+            elapsed_minutes = (now - _last_auto_bilan_time).total_seconds() / 60
+            if elapsed_minutes >= BILAN_INTERVAL_MINUTES:
+                await _save_ecart_snapshot(current_game_number)
+                await send_bilan_to_all(is_final=False)
         except Exception as e:
             logger.error(f"❌ Erreur auto_bilan_task: {e}")
 
@@ -3488,6 +3768,65 @@ async def cmd_bilaninterval(event):
         logger.error(f"Erreur cmd_bilaninterval: {e}")
         await event.respond(f"❌ Erreur: {e}")
 
+
+async def cmd_addproverbe(event):
+    """Commande /addproverbe [texte] — ajoute un proverbe à la liste."""
+    global _PROVERBES, _proverbes_queue
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        parts = event.raw_text.strip().split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await event.respond(
+                f"📖 **Proverbes actuels ({len(_PROVERBES)}) :**\n\n" +
+                "\n".join(f"{i+1}. {p}" for i, p in enumerate(_PROVERBES)) +
+                "\n\nUsage : `/addproverbe Votre proverbe ici`"
+            )
+            return
+        nouveau = parts[1].strip()
+        _PROVERBES.append(nouveau)
+        _proverbes_queue = []
+        await event.respond(
+            f"✅ Proverbe ajouté ({len(_PROVERBES)} au total) :\n_{nouveau}_"
+        )
+        logger.info(f"📖 Proverbe ajouté : {nouveau[:60]}")
+    except Exception as e:
+        logger.error(f"Erreur cmd_addproverbe: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
+async def cmd_addblague(event):
+    """Commande /addblague [texte] — ajoute une blague à la liste."""
+    global _BLAGUES, _blagues_queue
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    try:
+        parts = event.raw_text.strip().split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await event.respond(
+                f"😄 **Blagues actuelles ({len(_BLAGUES)}) :**\n\n" +
+                "\n".join(f"{i+1}. {b}" for i, b in enumerate(_BLAGUES)) +
+                "\n\nUsage : `/addblague Votre blague ici`"
+            )
+            return
+        nouvelle = parts[1].strip()
+        _BLAGUES.append(nouvelle)
+        _blagues_queue = []
+        await event.respond(
+            f"✅ Blague ajoutée ({len(_BLAGUES)} au total) :\n{nouvelle}"
+        )
+        logger.info(f"😄 Blague ajoutée : {nouvelle[:60]}")
+    except Exception as e:
+        logger.error(f"Erreur cmd_addblague: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
 # ============================================================================
 # SETUP ET DÉMARRAGE
 # ============================================================================
@@ -3521,6 +3860,8 @@ def setup_handlers():
     # Bilan
     client.add_event_handler(cmd_bilan, events.NewMessage(pattern=r'^/bilan$'))
     client.add_event_handler(cmd_bilaninterval, events.NewMessage(pattern=r'^/bilaninterval'))
+    client.add_event_handler(cmd_addproverbe, events.NewMessage(pattern=r'^/addproverbe'))
+    client.add_event_handler(cmd_addblague, events.NewMessage(pattern=r'^/addblague'))
 
     # Gestion
     client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
