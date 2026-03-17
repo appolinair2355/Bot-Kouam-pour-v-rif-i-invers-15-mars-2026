@@ -428,42 +428,30 @@ def compute_ecarts(max_game: int = 1440, suit_log: Dict = None) -> Dict[str, Lis
     Calcule les écarts (absences consécutives) pour chaque costume
     sur les jeux 1 à max_game.
 
-    IMPORTANT: Ne commence à compter les écarts qu'APRÈS la première apparition
-    du costume. Si le bot démarre au jeu #4 et que ♠️ n'est pas présent,
-    on n'attend pas ♠️ pour commencer le suivi.
-
     Retourne un dict {suit: [{'start': A, 'end': B, 'ecart': N}, ...]}
     où A = dernier jeu où le costume a été vu avant l'absence,
         B = premier jeu où il réapparaît après l'absence,
         ecart = B - A - 1  (nombre de jeux consécutifs absents).
+    Un écart de 1 signifie que le costume manquait sur exactement 1 jeu.
     """
     if suit_log is None:
         suit_log = game_suit_log
     result: Dict[str, List[Dict]] = {s: [] for s in ALL_SUITS}
 
     for suit in ALL_SUITS:
-        last_seen = None      # dernier jeu où le costume a été vu (None = pas encore vu)
+        last_seen = 0      # dernier jeu où le costume a été vu (0 = jamais encore)
         absent_start = None
 
-        # Trouver le premier jeu enregistré pour ce costume
-        games_sorted = sorted(suit_log.keys())
-        if not games_sorted:
-            continue
-
-        first_game = min(games_sorted)
-
-        for g in games_sorted:
-            if g > max_game:
-                break
-
+        for g in range(1, max_game + 1):
             suits_here = suit_log.get(g)
             if suits_here is None:
+                # Jeu non enregistré → ignorer (données manquantes)
                 continue
 
             if suit in suits_here:
                 # Costume présent
-                if absent_start is not None and last_seen is not None:
-                    # Fin d'une période d'absence
+                if absent_start is not None and last_seen > 0:
+                    # Fin d'une période d'absence (uniquement si le costume avait déjà été vu)
                     ecart_val = g - last_seen - 1
                     if ecart_val >= 1:
                         result[suit].append({
@@ -475,21 +463,18 @@ def compute_ecarts(max_game: int = 1440, suit_log: Dict = None) -> Dict[str, Lis
                 last_seen = g
             else:
                 # Costume absent — on ne commence à compter qu'après la première apparition
-                if last_seen is not None and absent_start is None:
+                if absent_start is None and last_seen > 0:
                     absent_start = g
 
         # Si absence encore en cours à la fin (seulement si le costume a été vu au moins une fois)
-        if absent_start is not None and last_seen is not None and last_seen < max_game:
-            # Vérifier si on a des jeux après last_seen
-            remaining_games = [g for g in games_sorted if g > last_seen and g <= max_game]
-            if remaining_games:
-                ecart_val = max_game - last_seen
-                if ecart_val >= 1:
-                    result[suit].append({
-                        'start': last_seen,
-                        'end': max_game,
-                        'ecart': ecart_val,
-                    })
+        if absent_start is not None and last_seen > 0 and last_seen < max_game:
+            ecart_val = max_game - last_seen
+            if ecart_val >= 1:
+                result[suit].append({
+                    'start': last_seen,
+                    'end': max_game,
+                    'ecart': ecart_val,
+                })
 
     return result
 
@@ -2257,96 +2242,75 @@ async def _generate_and_send_pdf(get_sender_fn, preds, header_lines, total, nb_g
     from reportlab.lib.units import mm
     from reportlab.lib import colors
 
-    try:
-        _PDF_SUIT_NAMES = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
+    _PDF_SUIT_NAMES = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
 
-        def clean(s):
-            for old, new in [
-                ('✅', ''), ('❌', ''), ('❓', '[?]'),
-                ('♠️','Pique'), ('❤️','Coeur'), ('♦️','Carreau'), ('♣️','Trefle'),
-                ('♠','Pique'), ('♥','Coeur'), ('♦','Carreau'), ('♣','Trefle'),
-                ('🏆','[W]'), ('💔','[L]'), ('🎰','[?]'), ('🔄',''), ('🔁',''),
-                ('📊',''), ('🎯',''), ('▸','>'), ('#','No.'),
-            ]:
-                s = s.replace(old, new)
-            # Supprimer les emojis restants (caractères hors ASCII de base)
-            s = ''.join(c if ord(c) < 0x2600 else '?' for c in s)
-            return s.strip()
+    def clean(s):
+        for old, new in [
+            ('✅', ''), ('❌', ''), ('❓', '[?]'),
+            ('♠️','Pique'), ('❤️','Coeur'), ('♦️','Carreau'), ('♣️','Trefle'),
+            ('♠','Pique'), ('♥','Coeur'), ('♦','Carreau'), ('♣','Trefle'),
+            ('🏆','[W]'), ('💔','[L]'), ('🎰','[?]'), ('🔄',''), ('🔁',''),
+            ('📊',''), ('🎯',''), ('▸','>'), ('#','No.'),
+        ]:
+            s = s.replace(old, new)
+        # Supprimer les emojis restants (caractères hors ASCII de base)
+        s = ''.join(c if ord(c) < 0x2600 else '?' for c in s)
+        return s.strip()
 
-        buf = BytesIO()
-        doc = SimpleDocTemplate(
-            buf, pagesize=A4,
-            rightMargin=15*mm, leftMargin=15*mm,
-            topMargin=15*mm, bottomMargin=15*mm
-        )
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=15*mm, leftMargin=15*mm,
+        topMargin=15*mm, bottomMargin=15*mm
+    )
 
-        styles = getSampleStyleSheet()
-        h1 = ParagraphStyle('H1', parent=styles['Heading1'], fontSize=13, spaceAfter=4)
-        h2 = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=10, spaceAfter=3)
-        norm = ParagraphStyle('Norm', parent=styles['Normal'], fontSize=9, spaceAfter=2)
-        indent = ParagraphStyle('Ind', parent=styles['Normal'], fontSize=9, spaceAfter=2, leftIndent=12)
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('H1', parent=styles['Heading1'], fontSize=13, spaceAfter=4)
+    h2 = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=10, spaceAfter=3)
+    norm = ParagraphStyle('Norm', parent=styles['Normal'], fontSize=9, spaceAfter=2)
+    indent = ParagraphStyle('Ind', parent=styles['Normal'], fontSize=9, spaceAfter=2, leftIndent=12)
 
-        story = []
-        story.append(Paragraph(f"Baccarat AI - Predictions ({total} total)", h1))
-        story.append(Paragraph(f"Statut : {clean(status_str)} | B={B}", norm))
-        story.append(Paragraph("Inverses : Pique<->Carreau  Coeur<->Trefle", norm))
-        story.append(Paragraph(f"Total {total} | Gagne {nb_gagne} | Perdu {nb_perdu} | En cours {nb_cours}", norm))
-        story.append(Spacer(1, 5*mm))
+    story = []
+    story.append(Paragraph(f"Baccarat AI - Predictions ({total} total)", h1))
+    story.append(Paragraph(f"Statut : {clean(status_str)} | B={B}", norm))
+    story.append(Paragraph("Inverses : Pique<->Carreau  Coeur<->Trefle", norm))
+    story.append(Paragraph(f"Total {total} | Gagne {nb_gagne} | Perdu {nb_perdu} | En cours {nb_cours}", norm))
+    story.append(Spacer(1, 5*mm))
 
-        for i, pred in enumerate(preds, 1):
-            suit_disp = _PDF_SUIT_NAMES.get(pred['suit'], pred['suit'])
-            status_txt = STATUS_ICONS.get(pred['status'], '?')
-            pred_type = TYPE_LABELS.get(pred['type'], pred['type'])
-            reason = pred.get('reason_text', '-')
-            pred_time = pred['predicted_at'].strftime('%d/%m %H:%M')
+    for i, pred in enumerate(preds, 1):
+        suit_disp = _PDF_SUIT_NAMES.get(pred['suit'], pred['suit'])
+        status_txt = STATUS_ICONS.get(pred['status'], '?')
+        pred_type = TYPE_LABELS.get(pred['type'], pred['type'])
+        reason = pred.get('reason_text', '-')
+        pred_time = pred['predicted_at'].strftime('%d/%m %H:%M')
 
-            story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
-            story.append(Paragraph(clean(f"No.{i}  Jeu No.{pred['predicted_game']}  ->  {suit_disp}"), h2))
-            story.append(Paragraph(clean(f"Statut : {status_txt}"), norm))
-            story.append(Paragraph(clean(f"Type   : {pred_type}"), norm))
-            story.append(Paragraph(f"Heure  : {pred_time}", norm))
-            story.append(Paragraph("Raison :", norm))
-            for r_line in reason.split('\n'):
-                if r_line.strip():
-                    story.append(Paragraph(clean(f"  - {r_line.strip()}"), indent))
-            story.append(Spacer(1, 4*mm))
+        story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
+        story.append(Paragraph(clean(f"No.{i}  Jeu No.{pred['predicted_game']}  ->  {suit_disp}"), h2))
+        story.append(Paragraph(clean(f"Statut : {status_txt}"), norm))
+        story.append(Paragraph(clean(f"Type   : {pred_type}"), norm))
+        story.append(Paragraph(f"Heure  : {pred_time}", norm))
+        story.append(Paragraph("Raison :", norm))
+        for r_line in reason.split('\n'):
+            if r_line.strip():
+                story.append(Paragraph(clean(f"  - {r_line.strip()}"), indent))
+        story.append(Spacer(1, 4*mm))
 
-        doc.build(story)
+    doc.build(story)
+    buf.seek(0)
 
-        # Vérification taille
-        pdf_size = buf.tell()
-        if pdf_size < 100:
-            logger.error(f"❌ PDF prédictions trop petit ({pdf_size} octets)")
-            return False
+    sender = await get_sender_fn()
+    caption = "\n".join(header_lines)
+    if len(caption) > 1000:
+        caption = caption[:1000] + "..."
 
-        buf.seek(0)
-
-        # Nom de fichier avec date
-        date_file = datetime.now().strftime('%Y%m%d_%H%M')
-        filename = f"predictions_baccarat_{date_file}.pdf"
-
-        sender = await get_sender_fn()
-        caption = "\n".join(header_lines)
-        if len(caption) > 1000:
-            caption = caption[:1000] + "..."
-
-        await client.send_file(
-            sender,
-            buf,
-            caption=caption,
-            file_name=filename,
-            force_document=True,
-            mime_type='application/pdf'
-        )
-
-        logger.info(f"✅ PDF prédictions envoyé: {filename}")
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ Erreur génération PDF prédictions: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
+    await client.send_file(
+        sender,
+        buf,
+        caption=caption,
+        file_name="predictions_baccarat.pdf",
+        force_document=True,
+        mime_type='application/pdf'
+    )
 
 
 async def cmd_informations(event):
