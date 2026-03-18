@@ -14,9 +14,10 @@ from aiohttp import web
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_ID,
-    SOURCE_CHANNEL_ID, PREDICTION_CHANNEL_ID, PORT,
+    PREDICTION_CHANNEL_ID, PORT,
     ALL_SUITS, SUIT_DISPLAY
 )
+from utils import get_latest_results
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +46,7 @@ last_source_game_number = 0
 last_prediction_time: Optional[datetime] = None
 prediction_channel_ok = False
 client = None
-waiting_finalization: Dict[int, dict] = {}
+processed_game_numbers: Set[int] = set()
 
 # Compteur2 - Gestion des costumes manquants (interne uniquement)
 compteur2_trackers: Dict[str, 'Compteur2Tracker'] = {}
@@ -79,7 +80,6 @@ prediction_history: List[Dict] = []
 
 # File d'attente de prédictions (plusieurs prédictions possibles)
 prediction_queue: List[Dict] = []  # File ordonnée des prédictions en attente
-PREDICTION_SEND_AHEAD = 2  # Envoyer la prédiction quand canal source est à N-2
 BILAN_INTERVAL_MINUTES = 20  # Intervalle auto-bilan en minutes (modifiable par admin)
 _last_auto_bilan_time = None  # Horodatage du dernier bilan automatique envoyé
 
@@ -121,20 +121,29 @@ async def resolve_channel(entity_id):
     try:
         if not entity_id:
             return None
-        
         normalized_id = normalize_channel_id(entity_id)
-        entity = await client.get_entity(normalized_id)
-        
-        if hasattr(entity, 'broadcast') and entity.broadcast:
-            logger.info(f"✅ Canal résolu: {entity.title} (ID: {normalized_id})")
+        # Premier essai : cache local
+        try:
+            entity = await client.get_entity(normalized_id)
+            title = getattr(entity, 'title', str(normalized_id))
+            if getattr(entity, 'broadcast', False):
+                logger.info(f"✅ Canal résolu: {title} (ID: {normalized_id})")
+            elif getattr(entity, 'megagroup', False):
+                logger.info(f"✅ Groupe résolu: {title} (ID: {normalized_id})")
             return entity
-        
-        if hasattr(entity, 'megagroup') and entity.megagroup:
-            logger.info(f"✅ Groupe résolu: {entity.title} (ID: {normalized_id})")
+        except Exception:
+            pass
+        # Second essai : rechargement des dialogues puis réessai
+        logger.info(f"⚙️ Rechargement dialogues pour résoudre {entity_id}…")
+        try:
+            await client.get_dialogs(limit=None)
+            entity = await client.get_entity(normalized_id)
+            title = getattr(entity, 'title', str(normalized_id))
+            logger.info(f"✅ Canal résolu après rechargement: {title}")
             return entity
-            
-        return entity
-        
+        except Exception as e2:
+            logger.error(f"❌ Impossible de résoudre le canal {entity_id}: {e2}")
+            return None
     except Exception as e:
         logger.error(f"❌ Impossible de résoudre le canal {entity_id}: {e}")
         return None
@@ -787,11 +796,12 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             last_prediction_time = datetime.now()
             pending_predictions[game_number]['message_id'] = msg_id
             pending_predictions[game_number]['status'] = 'en_cours'
+            pending_predictions[game_number]['secondary_channels_tracking'] = []
             add_prediction_to_history(game_number, suit, [game_number, game_number + 1, game_number + 2, game_number + 3], prediction_type, reason_text)
             success = True
             
             # Envoyer aux canaux secondaires SEULEMENT si le canal principal a réussi
-            # Collecter tous les canaux secondaires applicables
+            # Collecter tous les canaux secondaires applicables selon le mode
             secondary_channels = []
             if prediction_type == 'compteur2' and COMPTEUR2_CHANNEL_ID:
                 secondary_channels.append(COMPTEUR2_CHANNEL_ID)
@@ -802,7 +812,7 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
             if prediction_type == 'compteur2_c3' and CANAL_C2C3_ID:
                 secondary_channels.append(CANAL_C2C3_ID)
 
-            # Dédupliquer
+            # Dédupliquer et envoyer à chaque canal secondaire
             seen_cids = set()
             for cid in secondary_channels:
                 if cid in seen_cids:
@@ -812,8 +822,10 @@ async def send_prediction_multi_channel(game_number: int, suit: str, prediction_
                     cid, game_number, suit, prediction_type, is_secondary=True
                 )
                 if sec_msg_id:
-                    pending_predictions[game_number].setdefault('secondary_message_id', sec_msg_id)
-                    pending_predictions[game_number].setdefault('secondary_channel_id', cid)
+                    pending_predictions[game_number]['secondary_channels_tracking'].append({
+                        'msg_id': sec_msg_id,
+                        'channel_id': cid
+                    })
                     logger.info(f"📡 Canal redirect {cid}: #{game_number} envoyé (msg {sec_msg_id})")
         else:
             # Envoi échoué — retirer le placeholder pour ne pas bloquer le système
@@ -857,16 +869,26 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
     except Exception as e:
         logger.error(f"❌ Erreur édition message #{game_number}: {e}")
     
-    # Éditer le message de prédiction — canal secondaire (même contenu)
-    sec_msg_id = pred.get('secondary_message_id')
-    sec_channel_id = pred.get('secondary_channel_id')
-    if sec_msg_id and sec_channel_id:
+    # Éditer le message de prédiction — tous les canaux secondaires
+    secondary_channels_tracking = pred.get('secondary_channels_tracking', [])
+    # Compatibilité rétroactive avec l'ancien champ unique
+    if not secondary_channels_tracking:
+        sec_msg_id = pred.get('secondary_message_id')
+        sec_channel_id = pred.get('secondary_channel_id')
+        if sec_msg_id and sec_channel_id:
+            secondary_channels_tracking = [{'msg_id': sec_msg_id, 'channel_id': sec_channel_id}]
+    for sec_info in secondary_channels_tracking:
+        sec_msg_id = sec_info.get('msg_id')
+        sec_channel_id = sec_info.get('channel_id')
+        if not sec_msg_id or not sec_channel_id:
+            continue
         try:
             sec_entity = await resolve_channel(sec_channel_id)
             if sec_entity:
                 await client.edit_message(sec_entity, sec_msg_id, new_msg, parse_mode='markdown')
+                logger.info(f"✅ Canal secondaire {sec_channel_id} mis à jour pour #{game_number}")
         except Exception as e:
-            logger.error(f"❌ Erreur édition canal secondaire #{game_number}: {e}")
+            logger.error(f"❌ Erreur édition canal secondaire {sec_channel_id} #{game_number}: {e}")
     
 
 async def update_prediction_progress(game_number: int, current_check: int):
@@ -891,16 +913,24 @@ async def update_prediction_progress(game_number: int, current_check: int):
     except Exception as e:
         logger.error(f"❌ Erreur update progress: {e}")
     
-    # Canal secondaire (synchronisation progression)
-    sec_msg_id = pred.get('secondary_message_id')
-    sec_channel_id = pred.get('secondary_channel_id')
-    if sec_msg_id and sec_channel_id:
+    # Canaux secondaires (synchronisation progression)
+    secondary_channels_tracking = pred.get('secondary_channels_tracking', [])
+    if not secondary_channels_tracking:
+        sec_msg_id = pred.get('secondary_message_id')
+        sec_channel_id = pred.get('secondary_channel_id')
+        if sec_msg_id and sec_channel_id:
+            secondary_channels_tracking = [{'msg_id': sec_msg_id, 'channel_id': sec_channel_id}]
+    for sec_info in secondary_channels_tracking:
+        sec_msg_id = sec_info.get('msg_id')
+        sec_channel_id = sec_info.get('channel_id')
+        if not sec_msg_id or not sec_channel_id:
+            continue
         try:
             sec_entity = await resolve_channel(sec_channel_id)
             if sec_entity:
                 await client.edit_message(sec_entity, sec_msg_id, msg, parse_mode='markdown')
         except Exception as e:
-            logger.error(f"❌ Erreur update progress canal secondaire: {e}")
+            logger.error(f"❌ Erreur update progress canal secondaire {sec_channel_id}: {e}")
 
 async def check_prediction_result(game_number: int, first_group: str) -> bool:
     suits_in_result = get_suits_in_group(first_group)
@@ -1358,63 +1388,155 @@ async def process_game_result(game_number: int, message_text: str):
     #    → les prédictions avec send_at = game_number sont envoyées immédiatement
     await process_prediction_queue(game_number)
 
-async def handle_message(event, is_edit: bool = False):
-    try:
-        chat = await event.get_chat()
-        chat_id = chat.id
-        
-        if hasattr(chat, 'broadcast') and chat.broadcast:
-            if not str(chat_id).startswith('-100'):
-                chat_id = int(f"-100{abs(chat_id)}")
-        
-        normalized_source = normalize_channel_id(SOURCE_CHANNEL_ID)
-        if chat_id != normalized_source:
-            return
-        
-        message_text = event.message.message
-        edit_info = " [EDITÉ]" if is_edit else ""
-        logger.info(f"📨{edit_info} Msg {event.message.id}: {message_text[:60]}...")
-        
-        if is_message_being_edited(message_text):
-            logger.info(f"⏳ Message en cours d'édition (⏰), ignoré")
-            if '⏰' in message_text:
-                match = re.search(r"#N\s*(\d+)", message_text, re.IGNORECASE)
-                if match:
-                    waiting_finalization[int(match.group(1))] = {
-                        'msg_id': event.message.id,
-                        'text': message_text
-                    }
-            return
-        
-        if not is_message_finalized(message_text):
-            logger.info(f"⏳ Non finalisé ignoré")
-            return
-        
-        match = re.search(r"#N\s*(\d+)", message_text, re.IGNORECASE)
-        if not match:
-            match = re.search(r"(?:^|[^\d])(\d{3,4})(?:[^\d]|$)", message_text)
-        
-        if not match:
-            logger.warning("⚠️ Numéro non trouvé")
-            return
-        
-        game_number = int(match.group(1))
-        
-        if game_number in waiting_finalization:
-            del waiting_finalization[game_number]
-        
-        await process_game_result(game_number, message_text)
-        
-    except Exception as e:
-        logger.error(f"❌ Erreur handle_message: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+def build_synthetic_message(game_number: int, player_cards: list, banker_cards: list) -> str:
+    """Construit un message synthétique depuis les cartes API pour alimenter les compteurs."""
+    p_suits = "".join(c["S"] for c in player_cards)
+    b_suits = "".join(c["S"] for c in banker_cards)
+    return f"✅ #N{game_number} ({p_suits}) ({b_suits})"
 
-async def handle_new_message(event):
-    await handle_message(event, False)
 
-async def handle_edited_message(event):
-    await handle_message(event, True)
+API_POLL_INTERVAL = 10  # secondes entre chaque appel API
+
+# Suivi pour la commande /apisuivi
+_api_last_snapshot: List[Dict] = []
+_api_last_fetch_time: Optional[datetime] = None
+_api_total_fetches: int = 0
+_api_total_processed: int = 0
+
+
+def get_suits_from_api_cards(cards: list) -> list:
+    """Extrait et normalise les costumes d'une liste de cartes (format API 1xBet)."""
+    suits = []
+    for c in cards:
+        suit_raw = c.get("S", "")
+        for emoji, plain in [('♠️', '♠'), ('♦️', '♦'), ('♣️', '♣'), ('♥️', '♥'), ('❤️', '♥')]:
+            suit_raw = suit_raw.replace(emoji, plain)
+        if suit_raw in ('♠', '♦', '♣', '♥') and suit_raw not in suits:
+            suits.append(suit_raw)
+    return suits
+
+
+async def check_prediction_live(game_number: int, player_suits: list):
+    """Vérification dynamique temps réel sur jeu EN COURS — joueur uniquement.
+
+    Règles :
+    - Pendant que la partie est en cours, on vérifie UNIQUEMENT les costumes du joueur.
+    - Si le costume prédit est visible → statut GAGNÉ immédiatement.
+    - Si non trouvé → on n'intervient pas ; check_prediction_result() le traitera à la fin.
+    - Si toujours non trouvé après la fin de partie → rattrapage (numéro suivant).
+    """
+    if not pending_predictions:
+        return
+
+    # ── Vérification R0 : la partie en cours EST le jeu cible ──────────────
+    if game_number in pending_predictions:
+        pred = pending_predictions[game_number]
+        if pred['status'] == 'en_cours':
+            target_suit = pred['suit']
+            live_checked = pred.setdefault('live_checked', [])
+            if game_number not in live_checked:
+                if target_suit in player_suits:
+                    live_checked.append(game_number)
+                    logger.info(
+                        f"🟢 [LIVE R0] #{game_number}: {target_suit} vu chez le Joueur "
+                        f"({player_suits}) → GAGNÉ avant fin de partie"
+                    )
+                    await update_prediction_message(game_number, 'gagne', 0)
+                    update_prediction_in_history(
+                        game_number, target_suit, game_number,
+                        str(player_suits), 0, 'gagne_r0'
+                    )
+                    return
+                else:
+                    logger.debug(
+                        f"🔵 [LIVE R0] #{game_number}: {target_suit} pas encore vu "
+                        f"chez le Joueur ({player_suits}) — on attend la fin de partie"
+                    )
+
+    # ── Vérification Rn : la partie en cours est un jeu de rattrapage ───────
+    for original_game, pred in list(pending_predictions.items()):
+        if pred['status'] != 'en_cours':
+            continue
+        rattrapage = pred.get('rattrapage', 0)
+        if rattrapage == 0:
+            continue  # Jeu cible principal déjà géré ci-dessus
+        if game_number != original_game + rattrapage:
+            continue
+        target_suit = pred['suit']
+        live_checked = pred.setdefault('live_checked', [])
+        if game_number not in live_checked:
+            if target_suit in player_suits:
+                live_checked.append(game_number)
+                logger.info(
+                    f"🟢 [LIVE R{rattrapage}] #{game_number}: {target_suit} vu chez le Joueur "
+                    f"({player_suits}) → GAGNÉ avant fin de partie"
+                )
+                await update_prediction_message(original_game, 'gagne', rattrapage)
+                update_prediction_in_history(
+                    original_game, target_suit, game_number,
+                    str(player_suits), rattrapage, f'gagne_r{rattrapage}'
+                )
+                return
+            else:
+                logger.debug(
+                    f"🔵 [LIVE R{rattrapage}] #{game_number}: {target_suit} pas encore vu "
+                    f"chez le Joueur ({player_suits}) — on attend la fin de partie"
+                )
+
+
+async def api_polling_task():
+    """Tâche de fond : interroge l'API 1xBet régulièrement et traite les nouveaux jeux terminés."""
+    global processed_game_numbers, _api_last_snapshot, _api_last_fetch_time
+    global _api_total_fetches, _api_total_processed
+    logger.info("🌐 Démarrage du polling API 1xBet...")
+    loop = asyncio.get_event_loop()
+
+    while True:
+        try:
+            results = await loop.run_in_executor(None, get_latest_results)
+            _api_last_fetch_time = datetime.now()
+            _api_total_fetches += 1
+            _api_last_snapshot = results
+
+            # ── Vérification live sur les parties EN COURS (joueur uniquement) ──
+            if pending_predictions:
+                for result in results:
+                    if not result["is_finished"]:
+                        p_cards = result.get("player_cards", [])
+                        if p_cards:
+                            p_suits = get_suits_from_api_cards(p_cards)
+                            if p_suits:
+                                await check_prediction_live(result["game_number"], p_suits)
+
+            # ── Traitement des parties TERMINÉES ──
+            finished = [r for r in results if r["is_finished"]]
+            finished.sort(key=lambda r: r["game_number"])
+
+            for result in finished:
+                game_number = result["game_number"]
+                if game_number in processed_game_numbers:
+                    continue
+
+                player_cards = result.get("player_cards", [])
+                banker_cards = result.get("banker_cards", [])
+
+                if not player_cards and not banker_cards:
+                    logger.debug(f"[API] Jeu #{game_number} sans cartes, ignoré")
+                    continue
+
+                synthetic_text = build_synthetic_message(game_number, player_cards, banker_cards)
+                logger.info(f"[API] Traitement jeu #{game_number} → {synthetic_text[:80]}")
+
+                processed_game_numbers.add(game_number)
+                _api_total_processed += 1
+                await process_game_result(game_number, synthetic_text)
+
+        except Exception as e:
+            logger.error(f"❌ Erreur api_polling_task: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        await asyncio.sleep(API_POLL_INTERVAL)
 
 # ============================================================================
 # RESET ET NOTIFICATIONS (CORRIGÉ)
@@ -1499,7 +1621,7 @@ async def auto_reset_system():
             await asyncio.sleep(60)
 
 async def perform_full_reset(reason: str, is_1440_reset: bool = False):
-    global pending_predictions, last_prediction_time, waiting_finalization
+    global pending_predictions, last_prediction_time, processed_game_numbers
     global last_prediction_number_sent, compteur2_trackers, prediction_queue
     global compteur1_trackers, compteur1_history, compteur3_trackers, prediction_history
     global bilan_snapshots, ecart_snapshots
@@ -1571,11 +1693,11 @@ async def perform_full_reset(reason: str, is_1440_reset: bool = False):
         tracker.last_game = 0
     
     pending_predictions.clear()
-    waiting_finalization.clear()
     prediction_queue.clear()
     prediction_history.clear()
     game_suit_log.clear()
     game_suit_log3.clear()
+    processed_game_numbers.clear()
     last_prediction_time = None
     last_prediction_number_sent = 0
 
@@ -1804,7 +1926,7 @@ async def cmd_canal_compteur2(event):
         await event.respond(f"❌ Erreur: {e}")
 
 async def cmd_canaux(event):
-    global COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID, SOURCE_CHANNEL_ID
+    global COMPTEUR2_CHANNEL_ID, PREDICTION_CHANNEL_ID
     global CANAL_C2_ID, CANAL_C3_ID, CANAL_C2C3_ID
 
     if event.is_group or event.is_channel:
@@ -1819,7 +1941,7 @@ async def cmd_canaux(event):
     lines = [
         "📡 **CONFIGURATION DES CANAUX**",
         "",
-        f"📥 **Source:** `{SOURCE_CHANNEL_ID}`",
+        f"📥 **Source:** API 1xBet (polling automatique)",
         f"📤 **Principal:** `{PREDICTION_CHANNEL_ID}`",
         "",
         "**Redirections par mode :**",
@@ -2061,7 +2183,7 @@ async def cmd_queue(event):
     try:
         lines = [
             "📋 **FILE D'ATTENTE**",
-            f"Écart: {MIN_GAP_BETWEEN_PREDICTIONS} | Envoi: N-{PREDICTION_SEND_AHEAD}",
+            f"Écart: {MIN_GAP_BETWEEN_PREDICTIONS} | Source: API 1xBet",
             "",
         ]
         
@@ -2074,15 +2196,14 @@ async def cmd_queue(event):
                 suit = SUIT_DISPLAY.get(pred['suit'], pred['suit'])
                 pred_type = pred['type']
                 pred_num = pred['game_number']
+                send_at = pred.get('send_at', pred_num)
                 
                 type_str = "📊C2" if pred_type == 'compteur2' else "🔄C3⚡" if pred_type == 'compteur3_inverse' else "🔁SYN" if pred_type == 'synchro_inverse' else "🤖"
 
-                send_threshold = pred_num - PREDICTION_SEND_AHEAD
-                
-                if current_game_number >= send_threshold:
+                if current_game_number >= send_at:
                     status = "🟢 PRÊT" if not pending_predictions else "⏳ Attente"
                 else:
-                    wait_num = send_threshold - current_game_number
+                    wait_num = send_at - current_game_number
                     status = f"⏳ Dans {wait_num}"
                 
                 lines.append(f"{i}. #{pred_num} {suit} | {type_str} | {status}")
@@ -3338,6 +3459,79 @@ def _mode_analyse_rich(mode: str, s: dict) -> list:
     return lines
 
 
+def _conseil_dynamique_strategies(stats: dict) -> list:
+    """Génère un bloc de conseils dynamiques et émotionnels sur les 3 stratégies selon leurs performances réelles."""
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "💬 **AVIS DE SOSSOU KOUAMÉ SUR VOS STRATÉGIES**",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    strategy_details = {
+        'compteur2':      {'name': 'Abracadabra 🔮',  'emoji': '🔮'},
+        'compteur3_seul': {'name': 'Cobra 🐍',         'emoji': '🐍'},
+        'compteur2_c3':   {'name': 'Python Pro 🐍🔮',  'emoji': '🐍🔮'},
+    }
+
+    ranked = sorted(
+        MODES_ORDER,
+        key=lambda m: (stats[m]['pct_win'], stats[m]['gagnes']),
+        reverse=True
+    )
+
+    for mode in ranked:
+        s = stats[mode]
+        info = strategy_details[mode]
+        name = info['name']
+        emoji = info['emoji']
+        total = s['total']
+        gagnes = s['gagnes']
+        perdu = s['perdu']
+        pct = s['pct_win']
+        r0 = s['r0']
+        heavy = s['r2'] + s['r3']
+
+        if total == 0:
+            lines.append(f"{emoji} **{name}** : Pas encore de données — elle attend son heure, patience !")
+            lines.append("")
+            continue
+
+        # Avis émotionnel selon taux de réussite
+        if pct >= 80:
+            humeur = f"🔥 Elle est EN FEU ! {pct}% de réussite — Sossou Kouamé est impressionné."
+            action = f"👉 Continuez sur {name} avec confiance. C'est elle qui dicte le rythme aujourd'hui !"
+        elif pct >= 65:
+            humeur = f"😎 Solide ! {pct}% — {name} tient bien la route."
+            action = f"👉 Maintenez vos mises sur {name}, elle est fiable pour l'instant."
+        elif pct >= 50:
+            humeur = f"🤔 Correcte mais perfectible : {pct}%. Elle peut mieux faire."
+            action = f"👉 Suivez {name} avec des mises modérées — elle cherche sa forme."
+        elif pct >= 35:
+            humeur = f"😬 Difficile ! {pct}% seulement. {name} traverse une zone de turbulences."
+            action = f"👉 Sossou Kouamé conseille de réduire les mises sur {name} le temps que ça se redresse."
+        else:
+            humeur = f"😤 {name} déçoit avec {pct}%. Sossou Kouamé n'est pas content !"
+            action = f"👉 Mettez {name} en pause et observez. Ne misez pas à l'aveugle sur elle maintenant."
+
+        # Commentaire sur les gains directs
+        if total > 0 and r0 / total >= 0.5:
+            direct_comment = f"⚡ Particularité : {r0} gains directs (R0) sur {total} — elle frappe vite !"
+        elif heavy > 0 and total > 0 and heavy / total > 0.3:
+            direct_comment = f"💸 Attention : beaucoup de rattrapages lourds R2/R3 ({heavy}) — gérez votre bankroll."
+        elif perdu == 0 and total > 0:
+            direct_comment = f"🏆 Incroyable : 0 perte sur {total} prédictions — une machine de guerre !"
+        else:
+            direct_comment = f"📊 Bilan : {gagnes} gagné(s) — {perdu} perdu(s) sur {total} prédictions."
+
+        lines.append(f"{emoji} **{name}**")
+        lines.append(f"   {humeur}")
+        lines.append(f"   {direct_comment}")
+        lines.append(f"   {action}")
+        lines.append("")
+
+    return lines
+
+
 def format_conseil_message(stats: dict, snapshots: list = None, ecart_snaps: list = None) -> str:
     """Conseil intermédiaire riche avec fréquences, manques, variation d'écarts + proverbe/blague."""
     ranked = sorted(
@@ -3461,19 +3655,8 @@ def format_conseil_message(stats: dict, snapshots: list = None, ecart_snaps: lis
             f"({stats[worst]['pct_lose']}% de pertes — trop risquée)."
         )
 
-    # Conseil stratégique "attendre 1 perdu"
-    lines += [
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "💼 **CONSEIL STRATÉGIQUE IMPORTANT**",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "🛡️ Sossou Kouamé recommande fortement :",
-        "   _Attendez qu'une prédiction soit perdue (❌) avant de commencer_",
-        "   _à miser. Cela évite de démarrer sur deux pertes consécutives_",
-        "   _et protège votre bankroll dès le départ._",
-        "   👉 **Entrez sur la prédiction qui suit une perte — jamais avant.**",
-        "",
-    ]
+    # Avis dynamique et émotionnel sur chaque stratégie
+    lines += _conseil_dynamique_strategies(stats)
 
     # Proverbe ou blague (alternance)
     lines += _pick_conseil_content()
@@ -3617,19 +3800,8 @@ def format_conseil_final_1440(stats: dict, snapshots: list, ecart_snaps: list) -
             f"À éviter ou à utiliser avec des mises très prudentes."
         )
 
-    # Conseil stratégique
-    lines += [
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "💼 **CONSEIL STRATÉGIQUE IMPORTANT**",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "🛡️ Sossou Kouamé recommande fortement :",
-        "   _Attendez qu'une prédiction soit perdue (❌) avant de commencer_",
-        "   _à miser. Cela évite de démarrer sur deux pertes consécutives_",
-        "   _et protège votre bankroll dès le départ._",
-        "   👉 **Entrez sur la prédiction qui suit une perte — jamais avant.**",
-        "",
-    ]
+    # Avis dynamique et émotionnel sur chaque stratégie
+    lines += _conseil_dynamique_strategies(stats)
 
     # Fin de cycle : proverbe ET blague (rapport complet de fin de journée)
     lines += [
@@ -3662,6 +3834,28 @@ async def _save_ecart_snapshot(game: int):
         logger.error(f"❌ Erreur snapshot écart: {e}")
 
 
+async def _send_long_message(entity, text: str, parse_mode: str = 'markdown'):
+    """Découpe et envoie un message long (limite Telegram 4096 chars)."""
+    MAX_LEN = 4000
+    if len(text) <= MAX_LEN:
+        await client.send_message(entity, text, parse_mode=parse_mode)
+        return
+    lines = text.split('\n')
+    chunk_lines: list = []
+    chunk_len = 0
+    for line in lines:
+        added = len(line) + 1
+        if chunk_len + added > MAX_LEN and chunk_lines:
+            await client.send_message(entity, '\n'.join(chunk_lines), parse_mode=parse_mode)
+            await asyncio.sleep(0.5)
+            chunk_lines = []
+            chunk_len = 0
+        chunk_lines.append(line)
+        chunk_len += added
+    if chunk_lines:
+        await client.send_message(entity, '\n'.join(chunk_lines), parse_mode=parse_mode)
+
+
 async def send_bilan_to_all(is_final: bool = False):
     """Envoie le bilan + conseil uniquement en chat privé à l'admin.
     is_final=True → conseil de fin de journée #1440.
@@ -3671,31 +3865,64 @@ async def send_bilan_to_all(is_final: bool = False):
     now_str = now.strftime('%d/%m/%Y %H:%M')
     game = current_game_number
 
-    stats = compute_bilan_by_mode(prediction_history)
+    try:
+        stats = compute_bilan_by_mode(prediction_history)
+    except Exception as e:
+        logger.error(f"❌ Erreur compute_bilan_by_mode: {e}")
+        stats = {m: {'total': 0, 'gagnes': 0, 'perdu': 0, 'r0': 0, 'r1': 0, 'r2': 0, 'r3': 0,
+                     'pct_win': 0, 'pct_lose': 0} for m in MODES_ORDER}
 
     # Sauvegarder le snapshot courant
     bilan_snapshots.append({'ts': now, 'game': game, 'stats': stats})
 
-    bilan_msg = format_bilan_message(stats, now_str, game)
+    try:
+        bilan_msg = format_bilan_message(stats, now_str, game)
+    except Exception as e:
+        logger.error(f"❌ Erreur format_bilan_message: {e}")
+        bilan_msg = f"📊 Bilan du {now_str} — jeu #{game}\n_(Erreur de formatage: {e})_"
 
-    if is_final:
-        conseil_msg = format_conseil_final_1440(stats, bilan_snapshots, ecart_snapshots)
-    else:
-        conseil_msg = format_conseil_message(stats, bilan_snapshots, ecart_snapshots)
+    try:
+        if is_final:
+            conseil_msg = format_conseil_final_1440(stats, bilan_snapshots, ecart_snapshots)
+        else:
+            conseil_msg = format_conseil_message(stats, bilan_snapshots, ecart_snapshots)
+    except Exception as e:
+        logger.error(f"❌ Erreur format_conseil_message: {e}")
+        conseil_msg = (
+            "💡 **CONSEIL SOSSOU KOUAMÉ**\n"
+            f"_(Données insuffisantes pour l'analyse complète — jeu #{game})_\n\n"
+            "🐍 **Cobra**, 🔮 **Abracadabra**, 🐍🔮 **Python Pro** sont en observation.\n"
+            "Sossou Kouamé analyse les performances — le prochain bilan sera plus complet !"
+        )
 
     _last_auto_bilan_time = now
 
-    # Envoi uniquement en chat privé à l'admin (pas dans le canal)
     if ADMIN_ID and ADMIN_ID != 0:
         try:
             admin_entity = await client.get_input_entity(ADMIN_ID)
-            await client.send_message(admin_entity, bilan_msg, parse_mode='markdown')
-            await asyncio.sleep(1)
-            await client.send_message(admin_entity, conseil_msg, parse_mode='markdown')
+        except Exception as e:
+            logger.error(f"❌ Impossible de résoudre l'admin pour bilan: {e}")
+            return
+
+        # Envoi du bilan (indépendant du conseil)
+        try:
+            await _send_long_message(admin_entity, bilan_msg)
+            logger.info(f"📊 Bilan {'final #1440' if is_final else 'intermédiaire'} envoyé à l'admin")
         except Exception as e:
             logger.error(f"❌ Erreur envoi bilan admin: {e}")
 
-    logger.info(f"📊 Bilan {'final #1440' if is_final else 'intermédiaire'} envoyé en privé à l'admin")
+        await asyncio.sleep(1)
+
+        # Envoi du conseil (indépendant du bilan — ne jamais bloquer l'un par l'autre)
+        try:
+            await _send_long_message(admin_entity, conseil_msg)
+            logger.info(f"💡 Conseil {'final #1440' if is_final else 'intermédiaire'} envoyé à l'admin")
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi conseil admin: {e}")
+    else:
+        logger.warning("⚠️ ADMIN_ID non configuré — bilan non envoyé")
+
+    logger.info(f"📊 Bilan {'final #1440' if is_final else 'intermédiaire'} traité (jeu #{game})")
 
 
 async def auto_bilan_task():
@@ -3831,6 +4058,79 @@ async def cmd_addblague(event):
 # SETUP ET DÉMARRAGE
 # ============================================================================
 
+async def cmd_apisuivi(event):
+    """Commande /apisuivi — affiche le dernier snapshot de l'API 1xBet."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    try:
+        # Optionnel : /apisuivi live → appel API immédiat
+        parts = event.raw_text.strip().split()
+        if len(parts) > 1 and parts[1].lower() == 'live':
+            loop = asyncio.get_event_loop()
+            results = await loop.run_in_executor(None, get_latest_results)
+            snapshot = results
+            source_label = "🔄 Appel API frais"
+        else:
+            snapshot = _api_last_snapshot
+            source_label = "💾 Dernier snapshot mémorisé"
+
+        fetch_time_str = _api_last_fetch_time.strftime('%H:%M:%S') if _api_last_fetch_time else "jamais"
+
+        lines = [
+            "🌐 **SUIVI API 1xBet — Baccarat**",
+            f"⏱ Dernier fetch : `{fetch_time_str}` | Intervalle : {API_POLL_INTERVAL}s",
+            f"📊 Fetches totaux : {_api_total_fetches} | Jeux traités : {_api_total_processed}",
+            f"🗂 Jeux déjà connus : {len(processed_game_numbers)}",
+            f"📡 {source_label}",
+            "",
+        ]
+
+        if not snapshot:
+            lines.append("❌ Aucune donnée récupérée pour l'instant.")
+        else:
+            total = len(snapshot)
+            finished = [r for r in snapshot if r["is_finished"]]
+            in_progress = [r for r in snapshot if not r["is_finished"]]
+
+            lines.append(f"**Jeux récupérés : {total}** (✅ {len(finished)} terminés | ⏳ {len(in_progress)} en cours)")
+            lines.append("")
+
+            if finished:
+                lines.append("**✅ Jeux terminés :**")
+                for r in sorted(finished, key=lambda x: x["game_number"]):
+                    gn = r["game_number"]
+                    p = " ".join(c["S"] for c in r.get("player_cards", []))
+                    b = " ".join(c["S"] for c in r.get("banker_cards", []))
+                    winner = r.get("winner") or "?"
+                    already = "🔁" if gn in processed_game_numbers else "🆕"
+                    lines.append(f"  {already} #**{gn}** | J: {p or '—'} | B: {b or '—'} | 🏆 {winner}")
+                lines.append("")
+
+            if in_progress:
+                lines.append("**⏳ Jeux en cours / prématch :**")
+                for r in sorted(in_progress, key=lambda x: x["game_number"]):
+                    gn = r["game_number"]
+                    lines.append(f"  ⏳ #**{gn}**")
+
+        lines.append("")
+        lines.append("_/apisuivi live → appel API immédiat_")
+
+        msg = "\n".join(lines)
+        # Découper si trop long (limite Telegram ~4096 chars)
+        if len(msg) > 4000:
+            msg = msg[:3990] + "\n…(tronqué)"
+
+        await event.respond(msg, parse_mode='markdown')
+
+    except Exception as e:
+        logger.error(f"Erreur cmd_apisuivi: {e}")
+        await event.respond(f"❌ Erreur: {e}")
+
+
 def setup_handlers():
     # Configuration
     client.add_event_handler(cmd_gap, events.NewMessage(pattern=r'^/gap'))
@@ -3863,6 +4163,9 @@ def setup_handlers():
     client.add_event_handler(cmd_addproverbe, events.NewMessage(pattern=r'^/addproverbe'))
     client.add_event_handler(cmd_addblague, events.NewMessage(pattern=r'^/addblague'))
 
+    # API suivi
+    client.add_event_handler(cmd_apisuivi, events.NewMessage(pattern=r'^/apisuivi'))
+
     # Gestion
     client.add_event_handler(cmd_queue, events.NewMessage(pattern=r'^/queue$'))
     client.add_event_handler(cmd_pending, events.NewMessage(pattern=r'^/pending$'))
@@ -3872,9 +4175,6 @@ def setup_handlers():
     client.add_event_handler(cmd_reset, events.NewMessage(pattern=r'^/reset$'))
     client.add_event_handler(cmd_help, events.NewMessage(pattern=r'^/help$'))
 
-    # Messages
-    client.add_event_handler(handle_new_message, events.NewMessage())
-    client.add_event_handler(handle_edited_message, events.MessageEdited())
 
 async def start_bot():
     global client, prediction_channel_ok
@@ -3910,6 +4210,7 @@ async def main():
         
         asyncio.create_task(auto_reset_system())
         asyncio.create_task(auto_bilan_task())
+        asyncio.create_task(api_polling_task())
         
         app = web.Application()
         app.router.add_get('/health', lambda r: web.Response(text="OK"))

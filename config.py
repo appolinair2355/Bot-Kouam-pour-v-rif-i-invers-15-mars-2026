@@ -8,7 +8,8 @@ import os
 # TELEGRAM API CREDENTIALS
 # ============================================================================
 
-API_ID = int(os.environ.get("API_ID", 0))
+_api_id_raw = os.environ.get("API_ID", "0").strip()
+API_ID = int(_api_id_raw) if _api_id_raw else 0
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -17,14 +18,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # ============================================================================
 
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-SOURCE_CHANNEL_ID = -1002682552255
 PREDICTION_CHANNEL_ID = -1003430118891
 
 # ============================================================================
 # PARAMÈTRES DU SERVEUR WEB
 # ============================================================================
 
-PORT = int(os.environ.get("PORT", 10000))
+PORT = int(os.environ.get("PORT", 5000))
 
 # ============================================================================
 # CONFIGURATION COSTUMES
